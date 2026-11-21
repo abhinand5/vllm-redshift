@@ -1,0 +1,32 @@
+# vLLM for 1x Radeon AI PRO R9700 (gfx1201) on the pip ROCm 10.0 (TheRock) stack: no system ROCm in the image.
+# Build context: build/<model>/src (upstream vLLM + the model's patches), see scripts/build-image.sh.
+FROM python:3.12-slim
+ARG MAX_JOBS=6
+ARG VLLM_VERSION=0.34.0+redshift
+ARG IDX="--index-url https://stable.repo.amd.com/rocm/pytorch/whl-next/ --extra-index-url https://stable.repo.amd.com/rocm/core/whl-next/ --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match"
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential git curl ca-certificates libnuma-dev \
+    && rm -rf /var/lib/apt/lists/* && pip install --no-cache-dir uv
+RUN uv pip install --system --no-cache $IDX "torch==2.13.0+rocm10.0.0" "triton==3.8.0" "torchvision==0.28.0+rocm10.0.0" \
+      "amd-torch-device-gfx1201==2.13.0+rocm10.0.0" "rocm[libraries,devel]==10.0.0" "rocm-sdk-device-gfx1201==10.0.0" \
+    && SP=$(python -c 'import site;print(site.getsitepackages()[0])') \
+    && uv pip install --system --no-cache $SP/_rocm_sdk_core/share/amd_smi
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.95
+ENV PATH=/root/.cargo/bin:$PATH
+ENV SP=/usr/local/lib/python3.12/site-packages
+ENV ROCM_PATH=$SP/_rocm_sdk_devel ROCM_HOME=$SP/_rocm_sdk_devel HIP_PATH=$SP/_rocm_sdk_devel HIP_PLATFORM=amd \
+    LD_LIBRARY_PATH=$SP/_rocm_sdk_core/lib:$SP/_rocm_sdk_libraries/lib \
+    VLLM_TARGET_DEVICE=rocm PYTORCH_ROCM_ARCH=gfx1201 HIP_VISIBLE_DEVICES=0 ROCR_VISIBLE_DEVICES=0
+COPY . /src
+WORKDIR /src
+RUN uv pip install --system --no-cache $IDX -c requirements/constraints-rocm10.txt \
+      "cmake>=3.26,<4" ninja "setuptools-rust>=1.9" "setuptools-scm>=8" "setuptools>=78.1.1,<80" wheel \
+      -r requirements/requirements-rocm-r9700.txt
+RUN export PATH=$ROCM_PATH/bin:$PATH CMAKE_PREFIX_PATH=$ROCM_PATH MAX_JOBS=$MAX_JOBS NVCC_THREADS=1 \
+      CMAKE_BUILD_PARALLEL_LEVEL=$MAX_JOBS SETUPTOOLS_SCM_PRETEND_VERSION=$VLLM_VERSION \
+    && uv pip install --system --no-cache --no-build-isolation $IDX -c requirements/constraints-rocm10.txt . \
+    && rm -rf build /root/.cargo/registry
+WORKDIR /
+# The R9700 tuning (GPU_MAX_HW_QUEUES=2 etc.) is applied by vLLM itself (vllm/platforms/rocm.py).
+ENV TRITON_CACHE_DIR=/root/.cache/triton VLLM_NO_USAGE_STATS=1
+EXPOSE 8005
+CMD ["vllm", "--help"]

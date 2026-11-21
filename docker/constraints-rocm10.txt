@@ -1,0 +1,5 @@
+torch==2.13.0+rocm10.0.0
+triton==3.8.0+git4cff872c.rocm10.0.0
+amd-torch-device-gfx1201==2.13.0+rocm10.0.0
+rocm==10.0.0
+torchvision==0.28.0+rocm10.0.0
