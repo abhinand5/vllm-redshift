@@ -12,4 +12,4 @@ export LD_LIBRARY_PATH="$sp/_rocm_sdk_core/lib:$sp/_rocm_sdk_libraries/lib${LD_L
 export ROCM_PATH=$sp/_rocm_sdk_devel ROCM_HOME=$sp/_rocm_sdk_devel HIP_PATH=$sp/_rocm_sdk_devel   # never /opt/rocm
 export HIP_VISIBLE_DEVICES=0 ROCR_VISIBLE_DEVICES=0 PYTHONPATH=$PWD/build/$M/src
 exec python -m vllm.entrypoints.cli.main serve "$MODEL_DIR" --served-model-name "$SERVED_NAME" --host 127.0.0.1 \
-  --port "$PORT" --max-model-len "$MAX_MODEL_LEN" $SERVE_ARGS "$@"
+  --port "$PORT" --max-model-len "$MAX_MODEL_LEN" $SERVE_ARGS $SPEC_ARGS "$@"

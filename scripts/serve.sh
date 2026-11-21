@@ -7,4 +7,4 @@ exec docker run --rm --name "redshift-$M" --device /dev/kfd --device /dev/dri --
   -e HIP_VISIBLE_DEVICES=0 -e ROCR_VISIBLE_DEVICES=0 \
   -v "$MODEL_DIR":/model:ro -v redshift-cache:/root/.cache \
   "$IMAGE" vllm serve /model --served-model-name "$SERVED_NAME" --host 0.0.0.0 --port "$PORT" \
-  --max-model-len "$MAX_MODEL_LEN" $SERVE_ARGS "$@"
+  --max-model-len "$MAX_MODEL_LEN" $SERVE_ARGS $SPEC_ARGS "$@"

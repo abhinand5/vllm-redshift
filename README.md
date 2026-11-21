@@ -19,25 +19,28 @@ scripts/update-patch.sh <model> <vllm-clone> <branch>   refresh the patch from a
 
 ## Models
 
-| model | vLLM base | decode, batch 1, no spec decoding | notes |
+| model | vLLM base | decode, batch 1 | notes |
 |---|---|---|---|
-| `inkling2-mini` (thinkingmachines/Inkling-2-Mini, NVFP4 + MXFP8 as shipped, lossless) | `bf151b7eb1` (main, 2026-11-21) | **70 tok/s** (128-token prompt, 256 out); llama.cpp Q8: 31 | 99.2% greedy top-1 vs GGUF Q8 reference; 24.8 GiB VRAM; DSpark speculation ported but not tuned on the real checkpoint; validated up to 32K context (196K target not yet soaked) |
+| `inkling2-mini` (thinkingmachines/Inkling-2-Mini, NVFP4 + MXFP8 weights as shipped) | `bf151b7eb1` (main, 2026-11-21) | **87 tok/s with DSpark** (coding prompt), **70 tok/s without**; llama.cpp Q8: 31 | defaults: 196,608 context, 2 concurrent requests sharing a 232K-token FP8 KV pool, DSpark 7-token drafts. Tested: two concurrent 94K-token needle prompts both answered, 69 tok/s decode at 94K. Prefill ~1.1K tok/s (not tuned). Greedy top-1 vs GGUF Q8: 99.2% BF16 KV, 97.9% FP8 KV |
 
 The Inkling patch = ROCm port of Inkling 2 (PR #67685) + Mini loop core (PR #69028) + gfx1201 kernels
-(NVFP4/MXFP8 expert GEMMs, decode GEMV, tuning) + `GPU_MAX_HW_QUEUES=2` default on RDNA4 (removes ~15 us
+(NVFP4/MXFP8 expert GEMMs, decode GEMV, unit-scale FP8 KV, tuning) + `GPU_MAX_HW_QUEUES=2` default on RDNA4 (removes ~15 us
 gaps between kernels in HIP graphs: 38 -> 60 tok/s on its own).
 
 ## Quick start
 
 ```bash
-git clone --recursive <this repo> && cd vllm-redshift
+git clone --recursive https://github.com/abhinand5/vllm-redshift && cd vllm-redshift
 scripts/build-image.sh inkling2-mini                  # once
 MODEL_DIR=~/models/Inkling-2-Mini scripts/serve.sh inkling2-mini
 curl localhost:8005/v1/chat/completions -H content-type:application/json \
   -d '{"model":"Inkling-2-Mini","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"none"}'
 ```
-`MAX_MODEL_LEN` (default 32768) and `PORT` (8005) are env overrides; extra args go to `vllm serve`
-(e.g. `--speculative-config '{"method":"dspark","num_speculative_tokens":3}'`).
+Env overrides: `MAX_MODEL_LEN` (196608), `PORT` (8005), `KV_CACHE_BYTES` (8.5 GiB: one 196K request needs 7.2 GiB
+with DSpark; the rest lets a second request share the pool), `SPEC_ARGS=` (empty: no DSpark, 70 tok/s, frees the
+draft's memory). Extra args go to `vllm serve`. DSpark only supports `num_speculative_tokens` 7 (checkpoint block 8).
+The KV budget is explicit because vLLM's automatic sizing keeps a fixed 3 GiB ROCm margin on top of the measured
+activation peak (it would offer 6.97 GiB, too little for 196K).
 
 Native (no docker): needs a venv with torch 2.13+rocm10.0, Triton 3.8 and a vLLM build of the same commit+patch
 (its `.so` files are symlinked into `build/<model>/src/vllm`):
