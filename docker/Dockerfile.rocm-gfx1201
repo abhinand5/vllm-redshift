@@ -9,7 +9,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
 RUN uv pip install --system --no-cache $IDX "torch==2.13.0+rocm10.0.0" "triton==3.8.0" "torchvision==0.28.0+rocm10.0.0" \
       "amd-torch-device-gfx1201==2.13.0+rocm10.0.0" "rocm[libraries,devel]==10.0.0" "rocm-sdk-device-gfx1201==10.0.0" \
     && SP=$(python -c 'import site;print(site.getsitepackages()[0])') \
-    && uv pip install --system --no-cache $SP/_rocm_sdk_core/share/amd_smi
+    && uv pip install --system --no-cache $SP/_rocm_sdk_core/share/amd_smi \
+    && rocm-sdk init && test -e $SP/_rocm_sdk_devel/lib/libamd_smi.so && test -x $SP/_rocm_sdk_devel/bin/hipcc
 RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.95
 ENV PATH=/root/.cargo/bin:$PATH
 ENV SP=/usr/local/lib/python3.12/site-packages
