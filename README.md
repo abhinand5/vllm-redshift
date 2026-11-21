@@ -1,5 +1,9 @@
 # vllm-redshift
 
+<p align="center">
+  <img src="./assets/banner.png" alt="vLLM RedShift — Fast vLLM ports for Radeon RDNA GPUs" width="640">
+</p>
+
 Fast vLLM ports for **one AMD Radeon AI PRO R9700 (gfx1201, RDNA4, 32 GB)**, one model at a time.
 Upstream vLLM is a pinned git submodule (`vllm/`, never edited). Each model directory holds the upstream
 commit it targets and a patch series on top of it, so models can sit on different vLLM versions and a rebase is
