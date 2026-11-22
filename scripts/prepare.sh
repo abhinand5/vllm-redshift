@@ -3,7 +3,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."; M=$1; . models/$M/model.env
 git submodule update --init vllm
-git -C vllm cat-file -e "$VLLM_COMMIT^{commit}" 2>/dev/null || git -C vllm fetch origin "$VLLM_COMMIT"
+if ! git -C vllm cat-file -e "$VLLM_COMMIT^{commit}" 2>/dev/null; then
+  # shallow clones (CI) fetch just that commit; full clones fetch it normally
+  if [ "$(git -C vllm rev-parse --is-shallow-repository)" = true ]; then git -C vllm fetch --depth 1 origin "$VLLM_COMMIT"
+  else git -C vllm fetch origin "$VLLM_COMMIT"; fi
+fi
 OUT=build/$M/src; rm -rf "$OUT"; mkdir -p "$OUT"
 git -C vllm archive "$VLLM_COMMIT" | tar -x -C "$OUT"
 # Apply in a throwaway repo: inside this repo's tree, git apply would silently skip the paths.
