@@ -29,29 +29,39 @@ pinned upstream vLLM, and ships it as a Docker image with an OpenAI-compatible s
 | **Prefill** | **~4,600 tok/s** at 4K-16K tokens, 3,700 tok/s at 64K |
 | **Extras** | tool calling, reasoning, up to 64 images per prompt, 0% CPU when idle |
 
-```mermaid
-%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#ED1C24"}}}}%%
-xychart-beta
-    title "Decode speed, 1 request, 512 tokens, greedy (tok/s, higher is better)"
-    x-axis ["llama.cpp Q8", "redshift", "+ DSpark, prose", "+ DSpark, code"]
-    y-axis "tokens / s" 0 --> 120
-    bar [31.4, 78.7, 87.1, 116.1]
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="./assets/inkling2-mini-compare-dark.svg">
+  <img alt="Inkling-2-Mini on one Radeon AI PRO R9700. Decode tok/s, vllm-redshift / Strata / llama.cpp: story 88.5 / 63.2 / 31.1, code 103.7 / 67.2 / 31.4, explain 85.7 / 60.2 / 31.2, 41K-token prompt 97.4 / 24.7 / 28.3. Prefill tok/s: 4K 4,625 / 824 / 522, 16K 4,440 / 798 / 367, 64K 3,668 / 674 / 149." src="./assets/inkling2-mini-compare-light.svg" width="100%">
+</picture>
 
-```mermaid
-%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#ED1C24"}}}}%%
-xychart-beta
-    title "Prefill speed by prompt length (tok/s, higher is better)"
-    x-axis ["4K tokens", "16K tokens", "64K tokens"]
-    y-axis "tokens / s" 0 --> 5000
-    bar [4557, 4523, 3728]
-```
+<details>
+<summary>The numbers as a table, plus T=1.0 sampling and llama.cpp with DSpark</summary>
 
-<sub>One R9700, FP8 KV, measured through the API with `scripts/release_check.py` (temperature 0) on 2026-11-22. At the
-model's default T=1.0 (1024 tokens, 6 seeds): prose 86.3, short code 102.2, 41K-token code prompt 133.3 tok/s. DSpark
-gains depend on how predictable the text is: code runs fastest. llama.cpp: Unsloth UD-Q8_K_XL GGUF on ROCm 7.2.4, no drafter. Two
-concurrent 191K-token "needle in a haystack" prompts: both answered correctly (v0.4.0: in one of three runs one answer
-ran past the test's 600-token limit while reasoning, after quoting the right code).</sub>
+Decode tok/s (512 tokens, mean of runs) and prefill tok/s (best run; cold: every prompt is fresh random text, so no
+engine reuses a cached prefix), measured 2026-11-22 through each engine's OpenAI API
+with [`scripts/compare-engines.py`](scripts/compare-engines.py); raw runs in
+[`results/inkling2-mini/compare-v0.4.0-20261122.json`](results/inkling2-mini/compare-v0.4.0-20261122.json).
+
+| | vllm-redshift v0.4.0 | Strata 0.2.19 | llama.cpp | llama.cpp + DSpark |
+|---|---:|---:|---:|---:|
+| Decode, story, T=0 / T=1 | **88.5** / **85.1** | 63.2 / 65.9 | 31.1 / 30.7 | 27.8 / 21.2 |
+| Decode, code, T=0 / T=1 | **103.7** / **108.5** | 67.2 / 65.6 | 31.4 / 30.8 | 37.5 / 29.8 |
+| Decode, explain, T=0 / T=1 | **85.7** / **93.1** | 60.2 / 65.6 | 31.2 / 30.7 | 26.4 / 24.9 |
+| Decode, 41K-token code prompt, T=0 / T=1 | **97.4** / **107.5** | 24.7 / 36.6 | 28.3 / 27.9 | 37.3 / 27.6 |
+| Prefill, 4K / 16K / 64K tokens | **4,625** / **4,440** / **3,668** | 824 / 798 / 674 | 522 / 367 / 149 | 507 / 361 / 150 |
+
+- **vllm-redshift**: this image, weights as shipped (NVFP4 + MXFP8 experts), FP8 KV, 196K context, 2 slots, DSpark.
+- **Strata**: the prebuilt Linux `rx9070` engine (`strata-inkling` 0.1.65) with its `SQ-20` pack, `--max-context 196608
+  --parallel 2 --kv fp8`, DSpark on. Its AMD backend loads only its own requantized `.strata` packs (the official
+  safetensors crash it at load), so it does not run the same weights. Its tok/s is the engine's own timing: its API
+  stream does not send reasoning tokens.
+- **llama.cpp**: Unsloth's `UD-Q8_K_XL` GGUF on ROCm 7.2.4, `-ngl 99 -c 70000 --flash-attn on`, default batch sizes;
+  DSpark from `dspark-Inkling-2-Mini-Q8_0.gguf` with `--spec-draft-n-max 7`.
+- The release check (`scripts/release_check.py`, T=0, single run each) gives the same picture: decode 87.1 / 116.1 /
+  86.5 tok/s, prefill 4,557 / 4,523 / 3,728 tok/s. Two concurrent 191K-token "needle in a haystack" prompts are answered
+  correctly.
+
+</details>
 
 ## Quick start
 
