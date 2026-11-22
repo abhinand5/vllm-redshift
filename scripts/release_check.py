@@ -114,7 +114,9 @@ def main():
         print(f"needles: {res['needles']}", flush=True)
 
     os.makedirs(os.path.dirname(a.out), exist_ok=True)
-    prev = sorted(f for f in glob.glob(os.path.join(os.path.dirname(a.out), "*.json")) if f != a.out)
+    # previous run = latest by the time recorded in each file (file names start with the version, which does not sort)
+    prev = sorted((f for f in glob.glob(os.path.join(os.path.dirname(a.out), "*.json")) if f != a.out),
+                  key=lambda f: json.load(open(f)).get("time", ""))
     json.dump(res, open(a.out, "w"), indent=1)
     old = json.load(open(prev[-1])) if prev else {}
     print(f"\n| metric | previous ({os.path.basename(prev[-1]) if prev else '-'}) | this run |\n|---|---|---|")

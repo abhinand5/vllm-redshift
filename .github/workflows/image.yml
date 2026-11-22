@@ -1,22 +1,19 @@
-# Build a model's docker image and publish it to GHCR.
-# Publishing is always a deliberate act, never a side effect of pushing to main:
-#   - push a tag "<model>/<version>", e.g.  git tag inkling2-mini/2026.11.22 && git push origin inkling2-mini/2026.11.22
-#   - or run it by hand: Actions -> image -> Run workflow (model, version)
-# Images: ghcr.io/<owner>/vllm-redshift:<model>-<version>, :<model>-<vllm commit> and :<model> (latest).
+# Build a model's docker image and publish it to GHCR. Publishing is always deliberate, never a side effect of main:
+#   - release: bump VERSION in models/<model>/model.env (+ CHANGELOG.md), then push the tag "<model>/v<VERSION>",
+#     e.g.  git tag inkling2-mini/v0.2.0 && git push origin inkling2-mini/v0.2.0
+#     -> :<model>-vX.Y.Z, :<model>-vX.Y, :<model> (latest release), :<model>-<vllm commit>
+#   - dev build: Actions -> image -> Run workflow (model) -> :<model>-dev-<short sha> only (never moves latest)
 name: image
 
 on:
   push:
-    tags: ["*/*"]
+    tags: ["*/v*"]
   workflow_dispatch:
     inputs:
       model:
         description: "model directory under models/"
         required: true
         default: inkling2-mini
-      version:
-        description: "version tag, e.g. 2026.11.22 (default: dev-<short sha>)"
-        required: false
 
 permissions:
   contents: read
@@ -36,13 +33,12 @@ jobs:
         env:
           TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
           IN_MODEL: ${{ inputs.model }}
-          IN_VERSION: ${{ inputs.version }}
         run: |
-          if [ -n "$TAG" ]; then model=${TAG%%/*}; version=${TAG#*/}
-          else model=$IN_MODEL; version=${IN_VERSION:-dev-${GITHUB_SHA::7}}; fi
-          [[ $model =~ ^[a-z0-9][a-z0-9._-]*$ && $version =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
-            || { echo "bad model/version: '$model' '$version'"; exit 1; }
+          if [ -n "$TAG" ]; then model=${TAG%%/*}; version=${TAG#*/}; release=true
+          else model=$IN_MODEL; version=dev-${GITHUB_SHA::7}; release=false; fi
+          [[ $model =~ ^[a-z0-9][a-z0-9._-]*$ ]] || { echo "bad model name: '$model'"; exit 1; }
           echo "model=$model" >> "$GITHUB_OUTPUT"; echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
           echo "repo=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/vllm-redshift" >> "$GITHUB_OUTPUT"
 
       # The image is ~18.6 GB unpacked (ROCm SDK + torch); a stock runner has ~14 GB free.
@@ -56,6 +52,17 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      - name: Check the release tag against model.env
+        if: steps.v.outputs.release == 'true'
+        run: |
+          [ -f models/${{ steps.v.outputs.model }}/model.env ] || { echo "no models/${{ steps.v.outputs.model }}"; exit 1; }
+          want=$(. models/${{ steps.v.outputs.model }}/model.env; echo "v$VERSION")
+          [[ $want =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "model.env VERSION is not semver: $want"; exit 1; }
+          [ "${{ steps.v.outputs.version }}" = "$want" ] \
+            || { echo "tag says ${{ steps.v.outputs.version }} but model.env says $want: bump VERSION first"; exit 1; }
+          grep -q "^## $want " models/${{ steps.v.outputs.model }}/CHANGELOG.md \
+            || { echo "no '## $want' entry in models/${{ steps.v.outputs.model }}/CHANGELOG.md"; exit 1; }
+
       - name: Fetch the pinned vLLM commit (shallow)
         run: git submodule update --init --depth 1 vllm
 
@@ -68,6 +75,21 @@ jobs:
           cat build-args.txt
           { echo "args<<EOF"; cat build-args.txt; echo "EOF"; } >> "$GITHUB_OUTPUT"
           echo "vllm=${VLLM_COMMIT::10}" >> "$GITHUB_OUTPUT"
+
+      - name: Image tags
+        id: tags
+        env:
+          R: ${{ steps.v.outputs.repo }}
+          M: ${{ steps.v.outputs.model }}
+          V: ${{ steps.v.outputs.version }}
+        run: |
+          {
+            echo "list<<EOF"; echo "$R:$M-$V"
+            if [ "${{ steps.v.outputs.release }}" = true ]; then
+              echo "$R:$M-${V%.*}"; echo "$R:$M"; echo "$R:$M-${{ steps.ctx.outputs.vllm }}"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@v3
 
@@ -86,10 +108,7 @@ jobs:
             MAX_JOBS=4
             ${{ steps.ctx.outputs.args }}
           push: true
-          tags: |
-            ${{ steps.v.outputs.repo }}:${{ steps.v.outputs.model }}-${{ steps.v.outputs.version }}
-            ${{ steps.v.outputs.repo }}:${{ steps.v.outputs.model }}-${{ steps.ctx.outputs.vllm }}
-            ${{ steps.v.outputs.repo }}:${{ steps.v.outputs.model }}
+          tags: ${{ steps.tags.outputs.list }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
@@ -103,6 +122,7 @@ jobs:
         run: |
           {
             echo "### ${{ steps.v.outputs.repo }}:${{ steps.v.outputs.model }}-${{ steps.v.outputs.version }}"
+            echo "tags:"; echo '${{ steps.tags.outputs.list }}' | sed 's/^/- /'
             echo "vLLM \`${{ steps.ctx.outputs.vllm }}\`, patches: \`$(. models/${{ steps.v.outputs.model }}/model.env; echo $PATCHES)\`"
             echo
             echo "\`\`\`"
