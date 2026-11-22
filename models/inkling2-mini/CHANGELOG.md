@@ -5,7 +5,7 @@ weights; MINOR = new vLLM base or new optimizations; PATCH = fixes only. Release
 (must equal `VERSION` in `model.env`). Numbers: 1x R9700, FP8 KV, `scripts/release-check.sh` unless noted.
 
 ## Unreleased
-- Image input on (`--limit-mm-per-prompt {"image":4}`): the ViT runs vLLM's Triton varlen attention on ROCm (no
+- Image input on (`--limit-mm-per-prompt {"image":64}`; agents resend history, so the cap counts every image in a session): the ViT runs vLLM's Triton varlen attention on ROCm (no
   upstream flash-attn needed) and keeps encoder graphs. Costs ~0.6 GiB VRAM; KV pool unchanged (416,701 tokens).
   Text decode/prefill unchanged.
 - Idle CPU: `ROCPROFILER_REGISTER_ENABLED=0` in the image and container args; ROCr's AsyncEventsLoop no longer
