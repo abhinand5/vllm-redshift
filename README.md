@@ -22,6 +22,7 @@ scripts/prepare.sh <model>      build/<model>/src = vllm@VLLM_COMMIT + patches
 scripts/build-image.sh <model>  docker image (builds vLLM's C++/Rust for gfx1201; ~30-60 min, MAX_JOBS=6)
 scripts/serve.sh <model>        OpenAI server in docker on 127.0.0.1:$PORT
 scripts/serve-native.sh <model> same without docker, from an existing pip-ROCm venv (see below)
+scripts/create-container.sh <model> persistent container vllm-<model> (serve.sh's args) for docker start/stop managers
 scripts/export-series.sh <model> <vllm-clone> <branch>   re-cut the series from a dev branch, check it rebuilds it
 scripts/release-check.sh <model> serve the image, measure it, compare with the last run (reports only)
 scripts/build-context.sh <model> build/<model>/src as the docker context (shared by build-image.sh and CI)
