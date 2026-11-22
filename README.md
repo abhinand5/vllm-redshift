@@ -23,6 +23,8 @@ scripts/serve.sh <model>        OpenAI server in docker on 127.0.0.1:$PORT
 scripts/serve-native.sh <model> same without docker, from an existing pip-ROCm venv (see below)
 scripts/export-series.sh <model> <vllm-clone> <branch>   re-cut the series from a dev branch, check it rebuilds it
 scripts/release-check.sh <model> serve the image, measure it, compare with the last run (reports only)
+scripts/build-context.sh <model> build/<model>/src as the docker context (shared by build-image.sh and CI)
+.github/workflows/image.yml     build + publish to GHCR on a <model>/<version> tag or manual run
 results/<model>/*.json          numbers from each release check
 ```
 
@@ -32,6 +34,7 @@ Development happens on a branch in a full vLLM clone (no fork or remote needed).
    `series.conf`, and proves `VLLM_COMMIT + series` is byte-identical to the branch.
 2. `scripts/build-image.sh <model>`, then `scripts/release-check.sh <model>`: prints this build next to the previous one.
 3. Decide, commit, push. The check never blocks a release.
+4. To publish an image: tag `<model>/<version>` and push the tag (CI builds and pushes to GHCR).
 
 ## Models
 
@@ -43,6 +46,16 @@ The Inkling series: two open upstream PRs (#67685 ROCm port of Inkling 2 Small, 
 (`GPU_MAX_HW_QUEUES=2` default on RDNA4: 38 -> 60 tok/s on its own; gfx12 bring-up; a tail-only sliding-window KV manager
 for conv state: 7.2 -> 3.9 GiB per 196K request; adaptive-verification profiling with routed inputs) and the gfx1201
 backend (NVFP4/MXFP8 expert GEMMs, decode GEMV, prefill attention, multi-row verify GEMV, launch fusion, FP8 KV).
+
+## Prebuilt images
+CI (`.github/workflows/image.yml`) builds each model's image on GitHub and publishes it to GHCR, but only when you ask:
+push a tag `<model>/<version>` (`git tag inkling2-mini/2026.11.22 && git push origin inkling2-mini/2026.11.22`) or run
+the workflow by hand (Actions -> image -> Run workflow). Pushing to `main` never publishes. Tags:
+`ghcr.io/abhinand5/vllm-redshift:<model>-<version>`, `:<model>-<vllm commit>`, `:<model>` (latest).
+```bash
+docker pull ghcr.io/abhinand5/vllm-redshift:inkling2-mini
+IMAGE=ghcr.io/abhinand5/vllm-redshift:inkling2-mini MODEL_DIR=~/models/Inkling-2-Mini scripts/serve.sh inkling2-mini
+```
 
 ## Quick start
 
