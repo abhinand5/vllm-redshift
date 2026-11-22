@@ -921,7 +921,7 @@ index 4f1a8202e0..cbde3303f3 100644
      results = dict(queue.get() for _ in range(world))
      assert all(not f for f in results.values()), results
 diff --git a/tests/models/inkling2/test_attention.py b/tests/models/inkling2/test_attention.py
-index bf25d2ab6c..8311798728 100644
+index bf25d2ab6c..1b49dcd466 100644
 --- a/tests/models/inkling2/test_attention.py
 +++ b/tests/models/inkling2/test_attention.py
 @@ -15,9 +15,21 @@ from vllm.models.inkling.nvidia.ops.fa4_rel_attention import bucket_max_seqlen_q
@@ -957,7 +957,7 @@ index bf25d2ab6c..8311798728 100644
  }
  
  
-@@ -94,9 +108,90 @@ def _ref_attention(
+@@ -94,9 +108,92 @@ def _ref_attention(
  
  
  @requires_sm90
@@ -1045,10 +1045,12 @@ index bf25d2ab6c..8311798728 100644
      [
 +        (24, 8, 16, None, "prefill"),
 +        (24, 8, 128, REL_EXTENT - 1, "chunked_prefill"),
++        (24, 8, 16, None, "chunked_prefill"),
++        (24, 8, 16, REL_EXTENT - 1, "prefill"),
          (12, 2, 16, None, "prefill"),
          (48, 8, 16, None, "prefill"),
          (12, 2, 128, REL_EXTENT - 1, "prefill"),
-@@ -105,10 +200,14 @@ def _ref_attention(
+@@ -105,10 +202,18 @@ def _ref_attention(
          (48, 8, 128, None, "chunked_prefill"),
          (12, 2, 16, None, "decode"),
          (48, 8, 128, REL_EXTENT - 1, "decode"),
@@ -1057,16 +1059,22 @@ index bf25d2ab6c..8311798728 100644
      ],
  )
 +# FA4's KV splits and split scheduler: ROCm's Triton kernel takes neither.
- @pytest.mark.parametrize(
--    "num_splits,use_scheduler", [(1, True), (8, True), (8, False), (32, False)]
++@pytest.mark.parametrize(
 +    "num_splits,use_scheduler",
 +    [(1, False)] if _is_rocm else [(1, True), (8, True), (8, False), (32, False)],
++)
++# Unit-scale FP8 KV: ROCm only (the NVIDIA kernels are tested above).
+ @pytest.mark.parametrize(
+-    "num_splits,use_scheduler", [(1, True), (8, True), (8, False), (32, False)]
++    "kv_fp8", [False, pytest.param(True, marks=requires_rocm)] if _is_rocm else [False]
  )
  @torch.inference_mode()
  def test_inkling2_rel_attention(
-@@ -120,18 +219,12 @@ def test_inkling2_rel_attention(
+@@ -119,19 +224,14 @@ def test_inkling2_rel_attention(
+     scenario,
      num_splits,
      use_scheduler,
++    kv_fp8,
  ):
 -    from vllm.models.inkling2.nvidia.ops import use_sm100_kernels
 -    from vllm.models.inkling2.nvidia.ops.attention import (
@@ -1088,7 +1096,17 @@ index bf25d2ab6c..8311798728 100644
      torch.manual_seed(0)
      device = "cuda"
      seqs = SCENARIOS[scenario]
-@@ -167,7 +260,28 @@ def test_inkling2_rel_attention(
+@@ -146,6 +246,9 @@ def test_inkling2_rel_attention(
+     kv[..., :HEAD_DIM] = torch.nn.functional.normalize(kv[..., :HEAD_DIM], dim=-1) * 2
+     kv = kv.bfloat16().transpose(1, 2)
+     key_cache, value_cache = kv.transpose(1, 2).split(HEAD_DIM, dim=-1)
++    if kv_fp8:
++        key_cache = key_cache.to(torch.float8_e4m3fn)
++        value_cache = value_cache.to(torch.float8_e4m3fn)
+     block_table = (
+         (torch.randperm(num_blocks - 1, device=device) + 1)[: len(seqs) * max_blocks]
+         .view(len(seqs), max_blocks)
+@@ -167,7 +270,28 @@ def test_inkling2_rel_attention(
      out = torch.empty(q.shape, device=device)
      lse = torch.empty(q.shape[1::-1], device=device)
  
@@ -1118,7 +1136,7 @@ index bf25d2ab6c..8311798728 100644
          _INKLING2_FA4_REL_ATTENTION_KERNEL(
              q,
              key_cache,
-@@ -185,6 +299,11 @@ def test_inkling2_rel_attention(
+@@ -185,6 +309,11 @@ def test_inkling2_rel_attention(
              lse=lse,
          )
      else:
@@ -1130,7 +1148,22 @@ index bf25d2ab6c..8311798728 100644
          rel_attention(
              q,
              key_cache,
-@@ -211,10 +330,16 @@ def test_inkling2_rel_attention(
+@@ -204,17 +333,30 @@ def test_inkling2_rel_attention(
+     lse = lse.t()
+ 
+     ref_out, ref_lse = _ref_attention(
+-        q, key_cache, value_cache, rel_logits, seqs, block_table, scale, window_left
++        q,
++        key_cache.bfloat16(),
++        value_cache.bfloat16(),
++        rel_logits,
++        seqs,
++        block_table,
++        scale,
++        window_left,
+     )
+     assert lse.shape == (num_tokens, num_heads) and lse.dtype == torch.float32
+     torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
      torch.testing.assert_close(lse, ref_lse, atol=1e-4, rtol=1e-5)
  
  
@@ -1149,7 +1182,7 @@ index bf25d2ab6c..8311798728 100644
  )
  @pytest.mark.parametrize(
      "query_lens,kv_lens",
-@@ -232,9 +357,9 @@ def test_inkling2_rel_attention(
+@@ -232,9 +374,9 @@ def test_inkling2_rel_attention(
  def test_inkling2_rel_decode_attention(
      num_heads, num_kv_heads, window_left, query_lens, kv_lens, block_size, num_splits
  ):
@@ -1162,7 +1195,7 @@ index bf25d2ab6c..8311798728 100644
  
      torch.manual_seed(0)
      device = "cuda"
-@@ -299,16 +424,20 @@ def test_inkling2_rel_decode_attention(
+@@ -299,16 +441,20 @@ def test_inkling2_rel_decode_attention(
      assert (out[num_tokens:] == 0).all()
  
  
@@ -1187,7 +1220,7 @@ index bf25d2ab6c..8311798728 100644
  
      torch.manual_seed(0)
      device = "cuda"
-@@ -416,10 +545,97 @@ def test_inkling2_decode_attention_after_prologue(is_local, num_splits):
+@@ -416,10 +562,97 @@ def test_inkling2_decode_attention_after_prologue(is_local, num_splits):
          torch.testing.assert_close(out, expected, atol=0, rtol=0)
  
  
@@ -1288,7 +1321,7 @@ index bf25d2ab6c..8311798728 100644
      torch.manual_seed(0)
      num_heads, head_dim = 12, 128
 diff --git a/tests/models/inkling2/test_core_ops.py b/tests/models/inkling2/test_core_ops.py
-index dea9098a58..1d97ff2c93 100644
+index dea9098a58..b4d40ec904 100644
 --- a/tests/models/inkling2/test_core_ops.py
 +++ b/tests/models/inkling2/test_core_ops.py
 @@ -3,22 +3,41 @@
@@ -1445,7 +1478,7 @@ index dea9098a58..1d97ff2c93 100644
 +    torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-4)
 +
 +
-+@pytest.mark.parametrize("tokens", [1, 300])
++@pytest.mark.parametrize("tokens", [1, 8, 300])
 +def test_loop_blend_matches_per_stream_controllers(tokens):
 +    """The stream-batched controllers (shared `dest` and norm weight, as a
 +    local layer's q/k/v) equal each stream's reference controller followed by
@@ -1539,7 +1572,7 @@ index dea9098a58..1d97ff2c93 100644
          conv = residual.clone() if with_residual else torch.empty_like(x)
          out = conv_mix(
              x,
-@@ -351,18 +494,22 @@ def test_conv_mix_matches_conv_then_attn_res(
+@@ -351,18 +494,99 @@ def test_conv_mix_matches_conv_then_attn_res(
              last if with_last else None,
              queries,
              norm_w,
@@ -1551,6 +1584,83 @@ index dea9098a58..1d97ff2c93 100644
          torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
  
  
++@pytest.mark.skipif(not _is_rocm, reason="the ROCm fused conv + mix")
++@pytest.mark.parametrize(
++    "num_stack,num_q,with_last,with_residual",
++    [
++        (1, 1, True, False),
++        (2, 1, False, False),
++        (3, 1, False, True),
++        (5, 3, False, True),
++        (4, 3, False, False),
++    ],
++)
++@pytest.mark.parametrize("dim", [2304, 4608])
++@pytest.mark.parametrize("with_norm", [True, False])
++@pytest.mark.parametrize("steps", [STEPS, LONG_STEPS])
++def test_rocm_conv_mix_matches_conv_then_attn_res(
++    num_stack, num_q, with_last, with_residual, dim, with_norm, steps
++):
++    """The ROCm `conv_mix` (one launch for small batches) equals
++    `short_conv` then `attn_res` bit for bit: conv output, conv-state cache
++    and mixes, over chunked prefill and decode steps."""
++    from vllm.models.inkling2.amd.ops.sconv import conv_mix as rocm_conv_mix
++
++    block, heads, offset = 4, 2, 256
++    stream_width = dim // heads
++    row = offset + stream_width
++    weight = torch.randn(dim, 4, device=DEVICE).bfloat16()
++    queries = torch.randn(num_q, dim, device=DEVICE) * dim**-0.5
++    norm_w = torch.randn(num_q, dim, device=DEVICE).bfloat16() if with_norm else None
++    eps = 1e-6 if with_norm else 0.0
++    cache, block_table = _conv_cache_and_table(heads, block, row, 64)
++    ref_cache = cache.clone()
++    for _, _, _, meta in _chunked_steps(steps, block_table, block):
++        tokens = meta[0].shape[0]
++        x = torch.randn(tokens, dim, device=DEVICE).bfloat16()
++        stack = torch.randn(num_stack, tokens, dim, device=DEVICE).bfloat16()
++        last = torch.randn(tokens, dim, device=DEVICE).bfloat16()
++        addend = torch.randn(tokens, dim, device=DEVICE).bfloat16()
++        residual = torch.randn(tokens, dim, device=DEVICE).bfloat16()
++        ref_conv = residual.clone() if with_residual else None
++        ref_conv = short_conv(
++            x,
++            weight,
++            ref_cache,
++            *meta,
++            offset,
++            stream_width,
++            addend if with_residual else None,
++            ref_conv,
++            ref_conv,
++        )
++        if with_last:
++            ref = attn_res(stack, last, ref_conv, queries, norm_w, eps, True)
++        else:
++            ref = attn_res(stack, ref_conv, None, queries, norm_w, eps, True)
++        # The residual is updated in place, as the model's MLP conv.
++        conv = residual.clone() if with_residual else torch.empty_like(last)
++        out = rocm_conv_mix(
++            x,
++            weight,
++            cache,
++            *meta,
++            offset,
++            stream_width,
++            conv,
++            conv if with_residual else None,
++            addend if with_residual else None,
++            stack,
++            last if with_last else None,
++            queries,
++            norm_w,
++            eps,
++        )
++        torch.testing.assert_close(conv, ref_conv, atol=0, rtol=0)
++        torch.testing.assert_close(cache, ref_cache, atol=0, rtol=0)
++        torch.testing.assert_close(out, ref, atol=0, rtol=0)
++
++
 +@pytest.mark.parametrize("split", [False, True])
  @pytest.mark.parametrize("dynamic", [False, True])
 -def test_attention_prologue_writes_clipped_k_and_normed_v(dynamic):
@@ -1565,7 +1675,7 @@ index dea9098a58..1d97ff2c93 100644
      width, block, heads, dim, kv_block = 4, 4, 2, 128, 16
      channels = heads * dim
      totals = [sum(s[i] for s in STEPS) for i in range(4)]
-@@ -441,3 +588,183 @@ def test_attention_prologue_writes_clipped_k_and_normed_v(dynamic):
+@@ -441,3 +665,332 @@ def test_attention_prologue_writes_clipped_k_and_normed_v(dynamic):
      num_tokens = sum(totals)
      assert (kv != 0).any(-1).sum() == num_tokens * heads
      assert (cache[..., : 2 * dim] != 0).any(-1).sum() == num_tokens * heads
@@ -1709,12 +1819,11 @@ index dea9098a58..1d97ff2c93 100644
 +    torch.manual_seed(0)
 +    s = max(streams, 1)
 +    # Rows of a wider tensor (the projections slice qkvr's rows and stacks).
-+    weight = (torch.randn(s, n + 5, k, device=DEVICE) * k**-0.5).bfloat16()[:, 2 : n + 2]
++    weight = (torch.randn(s, n + 5, k, device=DEVICE) * k**-0.5).bfloat16()[
++        :, 2 : n + 2
++    ]
 +    x = torch.randn(s, 1, k + 8, device=DEVICE).bfloat16()[..., :k]
-+    if streams:
-+        args = (x, weight)
-+    else:
-+        args = (x[0], weight[0])
++    args = (x, weight) if streams else (x[0], weight[0])
 +
 +    def run():
 +        if streams or out_dtype is not None:
@@ -1740,20 +1849,178 @@ index dea9098a58..1d97ff2c93 100644
 +        check(out)
 +
 +
++@pytest.mark.skipif(not _is_rocm, reason="ROCm multi-row GEMV")
++@pytest.mark.parametrize("rows", [2, 3, 8, 16])
++@pytest.mark.parametrize(
++    "streams, n, k, out_dtype",
++    [
++        (0, 8600, 2304, None),  # qkvr
++        (0, 2304, 3072, None),  # wo_ud
++        (0, 2304, 9216, None),  # draft down_proj
++        (0, 131, 130, None),  # tails in N and K
++        (3, 64, 4608, None),  # loop controller down
++        (1, 64, 4608, None),  # loop controller down, one stream
++        (3, 4608, 64, torch.float32),  # loop controller gain / forget
++    ],
++)
++def test_rocm_gemv_rows_matches_fp64_and_graph(rows, streams, n, k, out_dtype):
++    """2..16-row GEMV (spec-decode verify windows): fp32-accumulated
++    `x @ w.T` within output rounding of fp64 for every row, on row-strided
++    weight slices and inputs, and stable under graph replay."""
++    from vllm.models.inkling2.amd.ops.linear import decode_linear, gemv_rows
++
++    torch.manual_seed(0)
++    s = max(streams, 1)
++    weight = (torch.randn(s, n + 5, k, device=DEVICE) * k**-0.5).bfloat16()[
++        :, 2 : n + 2
++    ]
++    x = torch.randn(s, rows, k + 8, device=DEVICE).bfloat16()[..., :k]
++    args = (x, weight) if streams else (x[0], weight[0])
++
++    def run():
++        if streams or out_dtype is not None:
++            return gemv_rows(*args, out_dtype)
++        return decode_linear(*args)
++
++    def check(out):
++        ref = torch.einsum("snk,smk->smn", weight.double(), x.double())
++        ref = ref if streams else ref[0]
++        dtype = out_dtype or torch.bfloat16
++        assert out.dtype == dtype and out.shape == ref.shape
++        rounding = (ref.to(dtype).double() - ref).abs()
++        assert ((out.double() - ref).abs() <= 1e-4 + rounding).all()
++
++    check(run())
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        out = run()
++    for _ in range(2):
++        x.copy_(torch.randn_like(x))
++        graph.replay()
++        check(out)
++
++
++@pytest.mark.skipif(not _is_rocm, reason="ROCm multi-row GEMV")
++@pytest.mark.parametrize("config", [(4, 2, 512, 1, 4), (4, 2, 512, 2, 8)])
++def test_rocm_gemv_rows_fma_modes_match_fp64(config):
++    """The fp32-FMA tiles (chunk- and late-reduced) the tuner may pick."""
++    from vllm.models.inkling2.amd.ops.linear import gemv_rows
++
++    torch.manual_seed(0)
++    x = torch.randn(3, 1000, device=DEVICE).bfloat16()
++    weight = (torch.randn(77, 1000, device=DEVICE) * 0.03).bfloat16()
++    out = gemv_rows(x, weight, config=config)
++    ref = x.double() @ weight.double().T
++    rounding = (ref.bfloat16().double() - ref).abs()
++    assert ((out.double() - ref).abs() <= 1e-4 + rounding).all()
++
++
 +@pytest.mark.skipif(not _is_rocm, reason="ROCm one-row GEMV")
-+def test_rocm_decode_linear_keeps_hipblaslt_for_batches():
-+    """Several rows (prefill, spec-decode verify) stay on `linear`, bitwise."""
++@pytest.mark.parametrize("rows", [17, 33])
++def test_rocm_decode_linear_keeps_hipblaslt_for_batches(rows):
++    """More than 16 rows (prefill) stay on `linear`, bitwise."""
 +    from vllm.models.inkling2.amd.ops.linear import decode_linear
 +
-+    x = torch.randn(4, 2304, device=DEVICE).bfloat16()
++    x = torch.randn(rows, 2304, device=DEVICE).bfloat16()
 +    weight = torch.randn(1024, 2304, device=DEVICE).bfloat16()
 +    expected = torch.nn.functional.linear(x, weight)
 +    torch.testing.assert_close(decode_linear(x, weight), expected, atol=0, rtol=0)
++
++
++@pytest.mark.skipif(not _is_rocm, reason="ROCm one-row GEMV")
++@pytest.mark.parametrize(
++    "sizes",
++    [
++        (6560, 1024, 1024, 32, 32),  # full layer: q side, k, v, k/v taps
++        (4616, 1024, 1024),  # looped local layer
++        (131, 7),
++    ],
++)
++def test_rocm_segment_gemv_matches_gemvs_and_graph(sizes):
++    """`segment_gemv` equals one `gemv` per (input, weight) pair bit for bit,
++    on row slices of a wider weight, and under graph replay."""
++    from vllm.models.inkling2.amd.ops.linear import gemv
++    from vllm.models.inkling2.amd.ops.segment_gemv import segment_gemv
++
++    torch.manual_seed(0)
++    k = 2304
++    big = (torch.randn(sum(sizes) + 9, k, device=DEVICE) * k**-0.5).bfloat16()
++    weights = list(big[3 : 3 + sum(sizes)].split(sizes))
++    xs = torch.randn(3, 1, k, device=DEVICE).bfloat16()
++    pairs = [(xs[i % 3], w) for i, w in enumerate(weights)]
++
++    def check(outs):
++        assert len(outs) == len(pairs)
++        for out, (x, w) in zip(outs, pairs):
++            torch.testing.assert_close(out, gemv(x, w), atol=0, rtol=0)
++
++    check(segment_gemv(pairs))
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        outs = segment_gemv(pairs)
++    for _ in range(2):
++        xs.copy_(torch.randn_like(xs))
++        graph.replay()
++        check(outs)
++
++
++@pytest.mark.skipif(not _is_rocm, reason="ROCm one-row GEMV")
++@pytest.mark.parametrize("broadcast", [False, True])
++def test_rocm_pair_norm_gemv_matches_norm_then_gemv(broadcast):
++    """The loop controller's first one-token GEMV with the pair RMSNorm
++    folded in equals `pair_rms_norm` then `gemv` bit for bit."""
++    from vllm.models.inkling2.amd.ops.linear import gemv
++    from vllm.models.inkling2.amd.ops.loop import pair_norm_gemv, pair_rms_norm
++
++    torch.manual_seed(0)
++    streams, d, rank = 3, 2304, 64
++    message = torch.randn(streams, 1, d, device=DEVICE) * 3
++    dest = torch.randn(1 if broadcast else streams, 1, d, device=DEVICE)
++    dest = dest.expand(streams, -1, -1)
++    weight = (torch.randn(streams + 1, rank, 2 * d, device=DEVICE) * 0.02).bfloat16()
++    weight = weight[1:]
++    ref = gemv(pair_rms_norm(dest, message), weight)
++    torch.testing.assert_close(
++        pair_norm_gemv(dest, message, weight), ref, atol=0, rtol=0
++    )
++
++
++@pytest.mark.parametrize("tokens", [1, 5, 16])
++def test_attn_res_batched_queries_match_per_layer(tokens):
++    """A loop pass's messages for every core layer in one `attn_res` launch
++    (`select_q` = the four streams) equal each layer's four-query launch bit
++    for bit."""
++    torch.manual_seed(0)
++    layers, streams, dim = 12, 4, 2304
++    bank = torch.randn(2, tokens, dim, device=DEVICE).bfloat16()
++    queries = torch.randn(layers, streams, dim, device=DEVICE) * dim**-0.5
++    batched = attn_res(
++        bank[:1],
++        bank[1],
++        None,
++        queries.view(-1, dim),
++        None,
++        0.0,
++        True,
++        select_q=streams,
++    )
++    for layer in range(layers):
++        ref = attn_res(bank[:1], bank[1], None, queries[layer], None, 0.0, True)
++        rows = batched[layer * streams : (layer + 1) * streams]
++        torch.testing.assert_close(rows, ref, atol=0, rtol=0)
 diff --git a/tests/models/inkling2/test_dspark.py b/tests/models/inkling2/test_dspark.py
-index cd24652704..945c308635 100644
+index cd24652704..73841a296e 100644
 --- a/tests/models/inkling2/test_dspark.py
 +++ b/tests/models/inkling2/test_dspark.py
-@@ -11,18 +11,29 @@ import torch.multiprocessing as mp
+@@ -3,6 +3,7 @@
+ """Inkling2 DSpark draft components against torch ports of the reference
+ implementation."""
+ 
++from functools import partial
+ from types import SimpleNamespace
+ 
+ import pytest
+@@ -11,18 +12,29 @@ import torch.multiprocessing as mp
  
  from vllm.platforms import current_platform
  
@@ -1788,7 +2055,7 @@ index cd24652704..945c308635 100644
      markov_gate,
      mix_rmsnorm,
  )
-@@ -141,6 +152,44 @@ def test_block_attention_anchored_window(is_local, num_splits):
+@@ -141,6 +153,45 @@ def test_block_attention_anchored_window(is_local, num_splits):
      assert (out[len(context_lens) * block :] == 0).all()
  
  
@@ -1821,6 +2088,7 @@ index cd24652704..945c308635 100644
 +    slots[3] = -1
 +    slots = slots.to(DEVICE)
 +    layer = SimpleNamespace(attn=attn, head_dim=head_dim)
++    layer._cache = partial(Inkling2DraftSelfAttention._cache, layer)
 +    Inkling2DraftSelfAttention._write_kv(layer, k, v, slots)
 +
 +    ref = torch.zeros_like(kv).flatten(0, 1)
@@ -1833,7 +2101,7 @@ index cd24652704..945c308635 100644
  def _all_reduce_norm_worker(rank: int, world: int, port: int, queue) -> None:
      from tests.utils import init_test_distributed_environment
      from vllm.distributed import (
-@@ -193,6 +242,11 @@ def _all_reduce_norm_worker(rank: int, world: int, port: int, queue) -> None:
+@@ -193,6 +244,11 @@ def _all_reduce_norm_worker(rank: int, world: int, port: int, queue) -> None:
      queue.put((rank, failures, stats))
  
  
@@ -1846,7 +2114,7 @@ index cd24652704..945c308635 100644
  def test_all_reduce_add_rmsnorm_matches_unfused(world):
      """The fused all-reduce + residual add + RMSNorm keeps the unfused bf16
 diff --git a/tests/models/inkling2/test_model.py b/tests/models/inkling2/test_model.py
-index bb0929836c..56b9f83e0a 100644
+index bb0929836c..b3a2709538 100644
 --- a/tests/models/inkling2/test_model.py
 +++ b/tests/models/inkling2/test_model.py
 @@ -2,28 +2,56 @@
@@ -1890,12 +2158,12 @@ index bb0929836c..56b9f83e0a 100644
 +    pytest.skip(
 +        "Inkling2 requires Hopper, Blackwell or gfx950/gfx12", allow_module_level=True
 +    )
-+
+ 
+-TINY_CONFIG = {
 +# The platform's implementation package (`vllm.models.inkling2` dispatches
 +# the shared exports the same way).
 +_IMPL = "vllm.models.inkling2." + ("amd" if current_platform.is_rocm() else "nvidia")
- 
--TINY_CONFIG = {
++
 +NUM_LAYERS = 2
 +TINY_CONFIG: dict[str, Any] = {
      "architectures": ["Inkling2ForConditionalGeneration"],
@@ -2181,7 +2449,7 @@ index bb0929836c..56b9f83e0a 100644
      )
      prompts = [list(range(2, 300)), [5, 5, 5]]
      outputs = llm.generate(
-@@ -97,6 +363,27 @@ def test_tiny_model_generates(tmp_path, draft_sample_method):
+@@ -97,6 +363,340 @@ def test_tiny_model_generates(tmp_path, draft_sample_method):
          token_ids = output.outputs[0].token_ids
          assert len(token_ids) == 24
          assert all(0 <= t < 1000 for t in token_ids)
@@ -2206,10 +2474,323 @@ index bb0929836c..56b9f83e0a 100644
 +        )
 +        assert drafted > 0
 +        assert 0 <= accepted <= drafted
++
++
++@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm DSpark glue")
++def test_tiny_model_adaptive_verification(tmp_path):
++    """Adaptive verification (per-request draft budgets trimmed on device)
++    replays the varlen verify graphs of the conv-state and attention
++    builders: two requests of different lengths decode with greedy DSpark
++    drafts, and the acceptance metrics stay consistent."""
++    model = _write_model(tmp_path, copy.deepcopy(TINY_LOOP_CONFIG))
++    llm = LLM(
++        speculative_config={
++            "method": "dspark",
++            "num_speculative_tokens": 7,
++            "draft_sample_method": "greedy",
++            "enable_adaptive_verification": True,
++        },
++        model=model,
++        load_format="dummy",
++        skip_tokenizer_init=True,
++        tokenizer_mode="hf",
++        gpu_memory_utilization=0.10,
++        max_model_len=2048,
++        max_num_seqs=4,
++        limit_mm_per_prompt={"image": 0},
++        disable_log_stats=False,
++    )
++    prompts = [list(range(2, 300)), [5, 5, 5]]
++    outputs = llm.generate(
++        [{"prompt_token_ids": p} for p in prompts],
++        SamplingParams(max_tokens=40, temperature=0, ignore_eos=True, detokenize=False),
++    )
++    for output in outputs:
++        token_ids = output.outputs[0].token_ids
++        assert len(token_ids) == 40
++        assert all(0 <= t < 1000 for t in token_ids)
++    from tests.v1.e2e.spec_decode.utils import get_spec_decode_metric_value
++
++    metrics = llm.get_metrics()
++    drafted = get_spec_decode_metric_value(metrics, "vllm:spec_decode_num_draft_tokens")
++    accepted = get_spec_decode_metric_value(
++        metrics, "vllm:spec_decode_num_accepted_tokens"
++    )
++    assert drafted > 0
++    assert 0 <= accepted <= drafted
++
++
++def _draft_attention_windows(worker) -> dict[str, int | None]:
++    context = worker.model_runner.vllm_config.compilation_config.static_forward_context
++    return {
++        name: layer.sliding_window
++        for name, layer in context.items()
++        if name.endswith(".self_attn.attn")
++    }
++
++
++def _draft_cache_dtypes(worker) -> set[torch.dtype]:
++    context = worker.model_runner.vllm_config.compilation_config.static_forward_context
++    return {
++        layer.kv_cache.dtype
++        for name, layer in context.items()
++        if name.endswith(".self_attn.attn")
++    }
++
++
++@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm DSpark draft")
++@pytest.mark.parametrize("draft_kv_dtype", ["auto", "fp8"])
++def test_tiny_model_draft_context(tmp_path, enable_pickle, draft_kv_dtype):
++    """`speculator_options.draft_context` turns the draft's global layer into
++    a sliding window over that many positions (smaller than the prompt here),
++    so its KV cache is a window's, and greedy decoding still runs and accepts
++    drafts, with a BF16 or a unit-scale FP8 draft cache."""
++    model = _write_model(tmp_path, copy.deepcopy(TINY_LOOP_CONFIG))
++    llm = LLM(
++        speculative_config={
++            "method": "dspark",
++            "num_speculative_tokens": 7,
++            "speculator_options": {"draft_context": 64},
++            "kv_cache_dtype": draft_kv_dtype,
++        },
++        model=model,
++        load_format="dummy",
++        skip_tokenizer_init=True,
++        tokenizer_mode="hf",
++        gpu_memory_utilization=0.10,
++        max_model_len=2048,
++        max_num_seqs=4,
++        limit_mm_per_prompt={"image": 0},
++        disable_log_stats=False,
++    )
++    windows = llm.collective_rpc(_draft_attention_windows)[0]
++    local = TINY_LOOP_CONFIG["mtp_config"]["local_layer_ids"]
++    window = TINY_LOOP_CONFIG["mtp_config"]["sliding_window_size"]
++    assert windows == {
++        f"model.layers.{i}.self_attn.attn": window if i in local else 64
++        for i in range(TINY_LOOP_CONFIG["mtp_config"]["num_hidden_layers"])
++    }
++    assert llm.collective_rpc(_draft_cache_dtypes)[0] == {
++        torch.uint8 if draft_kv_dtype == "fp8" else torch.bfloat16
++    }
++    outputs = llm.generate(
++        [{"prompt_token_ids": list(range(2, 300))}, {"prompt_token_ids": [5, 5, 5]}],
++        SamplingParams(max_tokens=24, temperature=0, ignore_eos=True, detokenize=False),
++    )
++    for output in outputs:
++        token_ids = output.outputs[0].token_ids
++        assert len(token_ids) == 24 and all(0 <= t < 1000 for t in token_ids)
++    from tests.v1.e2e.spec_decode.utils import get_spec_decode_metric_value
++
++    drafted = get_spec_decode_metric_value(
++        llm.get_metrics(), "vllm:spec_decode_num_draft_tokens"
++    )
++    assert drafted > 0
++
++
++@pytest.mark.parametrize(
++    "options,match",
++    [
++        ({"draft_ctx": 4}, "Unknown Inkling2 DSpark speculator_options"),
++        ({"draft_context": -1}, "non-negative integer"),
++        ({"draft_context": 1.5}, "non-negative integer"),
++    ],
++)
++def test_draft_context_option_validation(tmp_path, options, match):
++    from vllm.config import ParallelConfig, SpeculativeConfig
++    from vllm.config.model import ModelConfig
++
++    model = _write_model(tmp_path, copy.deepcopy(TINY_LOOP_CONFIG))
++    target = ModelConfig(model=model, tokenizer_mode="hf", skip_tokenizer_init=True)
++    with pytest.raises(ValueError, match=match):
++        SpeculativeConfig(
++            method="dspark",
++            num_speculative_tokens=7,
++            speculator_options=options,
++            target_model_config=target,
++            target_parallel_config=ParallelConfig(),
++        )
++
++
++def _conv_managers(worker) -> set[str]:
++    groups = worker.model_runner.kv_cache_config.kv_cache_groups
++    return {
++        g.manager_cls.__name__
++        for g in groups
++        if any(name.endswith(".conv_state") for name in g.layer_names)
++        or any(".conv_state." in name for name in g.layer_names)
++    }
++
++
++def _poison_null_block(worker) -> None:
++    """Fill block 0 (the null block) of every paged cache with NaN before
++    each forward: a read of a null block-table entry then shows up as NaN."""
++    runner = worker.model_runner
++    context = runner.vllm_config.compilation_config.static_forward_context
++    caches = [
++        layer.kv_cache
++        for layer in context.values()
++        if isinstance(getattr(layer, "kv_cache", None), torch.Tensor)
++        and layer.kv_cache.numel() > 0
++    ]
++    assert caches
++
++    def poison(*_):
++        for cache in caches:
++            # uint8 is FP8 storage: 0xFF is E4M3 NaN.
++            cache[0].fill_(255 if cache.dtype == torch.uint8 else float("nan"))
++
++    runner.model.register_forward_pre_hook(poison)
++
++
++def _conv_cache_run(
++    model: str,
++    monkeypatch,
++    *,
++    tail_only: bool,
++    speculate: bool = False,
++    poison: bool = False,
++    enforce_eager: bool = False,
++    prefix_caching: bool = False,
++    prompts: list[list[int]],
++    max_tokens: int = 16,
++    prompt_logprobs: bool = True,
++):
++    from vllm.models.inkling2.amd.sconv import Inkling2ConvState
++
++    # In-process engine so the manager switch reaches the worker.
++    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
++    monkeypatch.setattr(Inkling2ConvState, "tail_only", tail_only)
++    llm = LLM(
++        speculative_config=(
++            {"method": "dspark", "num_speculative_tokens": 7} if speculate else None
++        ),
++        model=model,
++        load_format="dummy",
++        skip_tokenizer_init=True,
++        tokenizer_mode="hf",
++        gpu_memory_utilization=0.10,
++        # 64-token chunks: a chunk's interior conv blocks are left null.
++        max_num_batched_tokens=64,
++        max_model_len=2048,
++        max_num_seqs=4,
++        enforce_eager=enforce_eager,
++        enable_prefix_caching=prefix_caching,
++        limit_mm_per_prompt={"image": 0},
++    )
++    managers = llm.collective_rpc(_conv_managers)[0]
++    assert managers == {
++        "TailSlidingWindowManager" if tail_only else "SlidingWindowManager"
++    }
++    if poison:
++        llm.collective_rpc(_poison_null_block)
++    results = []
++    for prompt in prompts:
++        # One request at a time: the same batches with either manager.
++        out = llm.generate(
++            [{"prompt_token_ids": prompt}],
++            SamplingParams(
++                max_tokens=max_tokens,
++                temperature=0,
++                logprobs=0,
++                # Prompt logprobs skip prefix-cache reads.
++                prompt_logprobs=0 if prompt_logprobs else None,
++                ignore_eos=True,
++                detokenize=False,
++            ),
++        )[0]
++        completion = out.outputs[0]
++        assert completion.logprobs is not None
++        results.append(
++            (
++                out.num_cached_tokens,
++                [
++                    next(iter(d.values())).logprob
++                    for d in out.prompt_logprobs or [None]
++                    if d
++                ],
++                list(completion.token_ids),
++                [
++                    lp[t].logprob
++                    for lp, t in zip(completion.logprobs, completion.token_ids)
++                ],
++            )
++        )
++    del llm
++    cleanup_dist_env_and_memory()
++    return results
++
++
++@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm conv manager")
++@pytest.mark.parametrize("speculate", [False, True])
++def test_conv_tail_cache_matches_window_cache(tmp_path, monkeypatch, speculate):
++    """The tail-only conv-state manager backs only the blocks a step can read
++    (the window before its first token), leaving a prefill chunk's interior
++    null: prefill and decode give bitwise the logprobs and tokens of the
++    sliding-window manager that backs every block in the window of a chunk,
++    with and without DSpark drafts in flight."""
++    model = _write_model(tmp_path, copy.deepcopy(TINY_LOOP_CONFIG))
++    prompts = [list(range(2, 302)), [5, 5, 5], list(range(40, 177))]
++    run = partial(
++        _conv_cache_run, model, monkeypatch, speculate=speculate, prompts=prompts
++    )
++    window = run(tail_only=False)
++    tail = run(tail_only=True)
++    assert tail == window
++
++
++@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm conv manager")
++def test_conv_tail_cache_never_reads_null_block(tmp_path, monkeypatch):
++    """The null block takes the interior writes of every prefill chunk;
++    nothing may read it back. With block 0 of every cache refilled with NaN
++    before each forward, the outputs are bitwise those of an unpoisoned run."""
++    model = _write_model(tmp_path, copy.deepcopy(TINY_LOOP_CONFIG))
++    prompts = [list(range(2, 302)), [5, 5, 5]]
++    run = partial(
++        _conv_cache_run,
++        model,
++        monkeypatch,
++        tail_only=True,
++        enforce_eager=True,
++        prompts=prompts,
++    )
++    clean = run()
++    poisoned = run(poison=True)
++    for _, prompt_lps, _, lps in poisoned:
++        assert all(x == x for x in prompt_lps + lps)  # no NaN
++    assert poisoned == clean
++
++
++@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm conv manager")
++def test_conv_tail_cache_prefix_hit(tmp_path, monkeypatch):
++    """A prefix-cache hit resumes at a backed conv block (a chunk end, as
++    chunk interiors are never cached): the hit request reads the cached conv
++    window before the hit and decodes like a full prefill."""
++    model = _write_model(tmp_path, copy.deepcopy(TINY_LOOP_CONFIG))
++    # 512 tokens: eight 64-token chunks, then the same prompt with a suffix.
++    shared = list(range(2, 514))
++    prompts = [shared, shared + list(range(600, 640))]
++    run = partial(
++        _conv_cache_run,
++        model,
++        monkeypatch,
++        tail_only=True,
++        max_tokens=8,
++        prompt_logprobs=False,
++    )
++    hit = run(prefix_caching=True, prompts=prompts)
++    full = run(prompts=prompts[1:])
++    assert hit[0][0] == 0
++    num_cached, _, tokens, lps = hit[1]
++    assert num_cached > 0 and num_cached % 64 == 0, num_cached
++    assert tokens == full[0][2]
++    torch.testing.assert_close(
++        torch.tensor(lps), torch.tensor(full[0][3]), rtol=0, atol=2e-2
++    )
  
  
  def test_tiny_model_lora_with_quantized_experts(tmp_path):
-@@ -123,6 +410,315 @@ def test_tiny_model_lora_with_quantized_experts(tmp_path):
+@@ -123,6 +723,315 @@ def test_tiny_model_lora_with_quantized_experts(tmp_path):
      assert len(outputs[0].outputs[0].token_ids) == 8
  
  
@@ -2525,7 +3106,7 @@ index bb0929836c..56b9f83e0a 100644
  def _chunked_mixed_run(model: str, enforce_eager: bool) -> list[list[float]]:
      llm = LLM(
          model=model,
-@@ -165,9 +761,9 @@ def test_piecewise_graphs_match_eager(tmp_path):
+@@ -165,9 +1074,9 @@ def test_piecewise_graphs_match_eager(tmp_path):
      replayed for any batch of the same token count, so attention must plan
      from the live batch: a chunked prompt prefilling alongside decodes runs
      and matches eager."""
@@ -2538,7 +3119,7 @@ index bb0929836c..56b9f83e0a 100644
      for g, e in zip(graph, eager):
          torch.testing.assert_close(torch.tensor(g), torch.tensor(e), rtol=0, atol=1e-2)
  
-@@ -223,3 +819,36 @@ def test_released_checkpoint_quant_config(tmp_path, quant_algo):
+@@ -223,3 +1132,36 @@ def test_released_checkpoint_quant_config(tmp_path, quant_algo):
      assert [quant_config.is_mxfp8_layer(i) for i in range(2)] == [
          i in mxfp8 for i in range(2)
      ]
@@ -3484,10 +4065,10 @@ index 0000000000..feafc55c50
 +    torch.testing.assert_close(out[:tokens], expected, atol=0, rtol=0)
 diff --git a/tests/models/inkling2/test_quant_rocm.py b/tests/models/inkling2/test_quant_rocm.py
 new file mode 100644
-index 0000000000..d752496102
+index 0000000000..021abca460
 --- /dev/null
 +++ b/tests/models/inkling2/test_quant_rocm.py
-@@ -0,0 +1,650 @@
+@@ -0,0 +1,709 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Inkling2 quantization on ROCm (`amd/`): hf_quant_config.json parameter
@@ -3798,8 +4379,8 @@ index 0000000000..d752496102
 +    return values.to(torch.uint8), scales.to(torch.float8_e4m3fn)
 +
 +
-+def _random_mxfp8(*shape: int) -> tuple[torch.Tensor, torch.Tensor]:
-+    values = torch.randn(shape, device="cuda").to(torch.float8_e4m3fn)
++def _random_mxfp8(*shape: int, std: float = 1.0) -> tuple[torch.Tensor, torch.Tensor]:
++    values = (torch.randn(shape, device="cuda") * std).to(torch.float8_e4m3fn)
 +    scales = torch.randint(120, 128, (*shape[:-1], shape[-1] // 32), device="cuda")
 +    return values, scales.to(torch.uint8)
 +
@@ -3893,10 +4474,10 @@ index 0000000000..d752496102
 +# --- NVFP4 GEMM (gfx12 kernel) ----------------------------------------------
 +
 +
-+def _bmm_case(counts, n, k, tile, weight, weight_scale, amax, seed=0):
++def _bmm_case(counts, n, k, tile, weight, weight_scale, amax, seed=0, act_std=1.0):
 +    torch.manual_seed(seed)
 +    plan = triton_bmm.expert_plan(sum(counts), 1, len(counts), tile)
-+    act, act_scale = _random_mxfp8(plan.rows, k)
++    act, act_scale = _random_mxfp8(plan.rows, k, std=act_std)
 +    tiles, rows = _tiles(counts, tile, plan)
 +    swizzle = swizzle_block_scales if tile >= 128 else _r8c4
 +    denominator = torch.tensor([2688.0], device="cuda")
@@ -3906,10 +4487,21 @@ index 0000000000..d752496102
 +    return plan, args, index, expert, _dequant_mxfp8(act, act_scale)
 +
 +
-+def _check_bmm(plan, args, index, expert, a64, label):
++def _run_kernel(kernel: str, args, plan) -> torch.Tensor:
++    """`bmm` as dispatched ("auto"), its WMMA kernel or the decode GEMV."""
++    if kernel == "gemv":
++        return nvfp4_moe.gemv(*args, plan)
++    if kernel == "wmma":
++        n, k_half = args[2].shape[1:]
++        config = nvfp4_moe.bmm_config(plan.tile, n, 2 * k_half)
++        return nvfp4_moe.bmm(*args, plan, config)
++    return nvfp4_moe.bmm(*args, plan)
++
++
++def _check_bmm(plan, args, index, expert, a64, label, kernel="auto"):
 +    """Kernel vs. the placeholder GEMM and an fp64 oracle (both rounded to
 +    bf16) on the routed rows; returns and prints the errors."""
-+    out = nvfp4_moe.bmm(*args, plan)[index].float()
++    out = _run_kernel(kernel, args, plan)[index].float()
 +    ref = nvfp4_bmm_reference(*args, plan)[index].float()
 +    act, _, weight, weight_scale, amax, denominator, _ = args
 +    w = _oracle_nvfp4(weight, weight_scale, amax, denominator)
@@ -3941,9 +4533,53 @@ index 0000000000..d752496102
 +    counts, n, k = [3, 0, 17, 1, 300], 256, 1024
 +    weight, weight_scale = _random_nvfp4(len(counts), n, k)
 +    amax = torch.rand(len(counts), device="cuda") * 100 + 100
-+    _check_bmm(
-+        *_bmm_case(counts, n, k, tile, weight, weight_scale, amax), f"tile={tile}"
++    case = _bmm_case(counts, n, k, tile, weight, weight_scale, amax)
++    _check_bmm(*case, f"tile={tile}", kernel="wmma")
++    if tile == 16:
++        _check_bmm(*case, f"tile={tile} gemv", kernel="gemv")
++
++
++def test_nvfp4_bmm_runs_gemv_for_decode_plans(monkeypatch):
++    """Plans of 16-row tiles up to `GEMV_MAX_CTAS` tiles go to `gemv`."""
++    calls = []
++    real = nvfp4_moe.gemv
++    monkeypatch.setattr(
++        nvfp4_moe, "gemv", lambda *a, **kw: calls.append(1) or real(*a, **kw)
 +    )
++    n, k = 64, 256
++    weight, weight_scale = _random_nvfp4(128, n, k)
++    amax = torch.ones(128, device="cuda")
++    denominator = torch.ones(1, device="cuda")
++    for tokens, gemv in ((1, True), (2, True), (4, False), (512, False)):
++        plan = triton_bmm.expert_plan(tokens, 8, 128)
++        act, act_scale = _random_mxfp8(plan.rows, k)
++        tiles, _ = _tiles([1] * 8, plan.tile, plan)
++        calls.clear()
++        nvfp4_moe.bmm(
++            act, act_scale, weight, weight_scale, amax, denominator, tiles, plan
++        )
++        assert bool(calls) == gemv, (tokens, plan)
++
++
++@pytest.mark.parametrize("k", [1152, 2304])
++@pytest.mark.parametrize("tiny", [False, True])
++def test_nvfp4_gemv_matches_fp64(k: int, tiny: bool):
++    """Decode GEMV at Mini's K (a partial last unrolled step at 1152), one to
++    a few rows per expert. `tiny`: e4m3 subnormal block scales (decoded
++    weights down to the fp16 subnormal 2^-24) and e4m3 subnormal
++    activations, so flushed fp16 / fp32 denormals would show."""
++    torch.manual_seed(0)
++    counts, n = [1, 0, 2, 1, 3, 16, 1], 256
++    weight, weight_scale = _random_nvfp4(len(counts), n, k)
++    if tiny:
++        weight_scale = torch.randint(1, 8, weight_scale.shape, device="cuda")
++        weight_scale = weight_scale.to(torch.uint8).view(torch.float8_e4m3fn)
++    amax = torch.rand(len(counts), device="cuda") + 0.5
++    act_std = 2.0**-7 if tiny else 1.0
++    case = _bmm_case(counts, n, k, 16, weight, weight_scale, amax, act_std=act_std)
++    if tiny:
++        assert (case[1][0].view(torch.uint8) & 0x78 == 0).float().mean() > 0.3
++    _check_bmm(*case, f"gemv k={k} tiny={tiny}", kernel="gemv")
 +
 +
 +@requires_checkpoint
@@ -3964,13 +4600,17 @@ index 0000000000..d752496102
 +    n, k = weight.shape[1], 2 * weight.shape[2]
 +    assert (n, k) == ((2304, 2304) if name == "w13" else (2304, 1152))
 +    counts = [1, 0, 9, 40] if tile == 16 else [130, 2, 0, 300]
-+    _check_bmm(
-+        *_bmm_case(counts, n, k, tile, weight, weight_scale, amax),
-+        f"L{layer} {name} tile={tile}",
-+    )
++    case = _bmm_case(counts, n, k, tile, weight, weight_scale, amax)
++    _check_bmm(*case, f"L{layer} {name} tile={tile}", kernel="wmma")
++    if tile == 16:
++        _check_bmm(*case, f"L{layer} {name} gemv", kernel="gemv")
++        # Decode routing: a row or two per expert.
++        case = _bmm_case([1, 2, 1, 1], n, k, tile, weight, weight_scale, amax, 1)
++        _check_bmm(*case, f"L{layer} {name} gemv decode", kernel="gemv")
 +
 +
-+def test_nvfp4_bmm_graph_capture():
++@pytest.mark.parametrize("kernel", ["wmma", "gemv"])
++def test_nvfp4_bmm_graph_capture(kernel: str):
 +    """The GEMM captures in a (HIP) graph and replays on new routing and
 +    activations with the same result as eager calls."""
 +    torch.manual_seed(0)
@@ -3979,11 +4619,11 @@ index 0000000000..d752496102
 +    amax = torch.rand(4, device="cuda") + 1
 +    plan, args, *_ = _bmm_case([2, 5, 0, 1], n, k, tile, weight, weight_scale, amax)
 +    static = [a.clone() for a in args]
-+    nvfp4_moe.bmm(*static, plan)
++    _run_kernel(kernel, static, plan)
 +    torch.cuda.synchronize()
 +    graph = torch.cuda.CUDAGraph()
 +    with torch.cuda.graph(graph):
-+        out = nvfp4_moe.bmm(*static, plan)
++        out = _run_kernel(kernel, static, plan)
 +    for counts, seed in (([2, 5, 0, 1], 1), ([0, 1, 7, 0], 2)):
 +        _, new, index, *_ = _bmm_case(
 +            counts, n, k, tile, weight, weight_scale, amax, seed
@@ -3992,7 +4632,7 @@ index 0000000000..d752496102
 +            dst.copy_(src)
 +        graph.replay()
 +        torch.cuda.synchronize()
-+        assert torch.equal(out[index], nvfp4_moe.bmm(*new, plan)[index])
++        assert torch.equal(out[index], _run_kernel(kernel, new, plan)[index])
 +
 +
 +# --- NVFP4 MoE layer --------------------------------------------------------
@@ -4353,6 +4993,39 @@ index 912ab47391..cc0abd53ad 100644
      "Inkling2ForConditionalGeneration": (
          "vllm.models.inkling2",
          "Inkling2ForConditionalGeneration",
+diff --git a/vllm/models/inkling/amd/sconv_swa_attn.py b/vllm/models/inkling/amd/sconv_swa_attn.py
+index d0212731bf..140f12039f 100644
+--- a/vllm/models/inkling/amd/sconv_swa_attn.py
++++ b/vllm/models/inkling/amd/sconv_swa_attn.py
+@@ -31,9 +31,10 @@ from vllm.v1.attention.backend import (
+     AttentionMetadata,
+     AttentionMetadataBuilder,
+     CommonAttentionMetadata,
++    max_decode_query_len,
+ )
+ from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
+-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayerConfig
++from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayerConfig, KVCacheSpec
+ 
+ from .ops.sconv import sconv_seq_metadata
+ 
+@@ -52,6 +53,16 @@ class InklingSconvMetadata(AttentionMetadata):
+ class InklingSconvMetadataBuilder(AttentionMetadataBuilder[InklingSconvMetadata]):
+     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+ 
++    @classmethod
++    def get_varlen_cudagraph_max_query_len(
++        cls, vllm_config: VllmConfig, kv_cache_spec: KVCacheSpec
++    ) -> int | None:
++        # `build` derives every per-token row from the device
++        # `query_start_loc` (after adaptive verification trims it), so a
++        # decode graph replays requests of 1..L query tokens.
++        del kv_cache_spec
++        return max_decode_query_len(vllm_config)
++
+     def __init__(
+         self,
+         kv_cache_spec: AttentionSpec,
 diff --git a/vllm/models/inkling2/__init__.py b/vllm/models/inkling2/__init__.py
 index 7ce6fd0525..552fc2a17b 100644
 --- a/vllm/models/inkling2/__init__.py
@@ -4465,10 +5138,10 @@ index 0000000000..208f01a7cb
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 diff --git a/vllm/models/inkling2/amd/attention.py b/vllm/models/inkling2/amd/attention.py
 new file mode 100644
-index 0000000000..27236da327
+index 0000000000..7ffc879ffd
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/attention.py
-@@ -0,0 +1,455 @@
+@@ -0,0 +1,493 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Inkling2 attention: relative-bias GQA with short-conv K/V, L2-clipped
@@ -4497,7 +5170,7 @@ index 0000000000..27236da327
 +    canonicalize_singleton_dim_strides,
 +    kv_cache_dtype_str_to_dtype,
 +)
-+from vllm.v1.attention.backend import AttentionBackend
++from vllm.v1.attention.backend import AttentionBackend, max_decode_query_len
 +from vllm.v1.attention.backends.flash_attn import (
 +    FlashAttentionBackend,
 +    FlashAttentionMetadata,
@@ -4507,7 +5180,7 @@ index 0000000000..27236da327
 +    FullAttentionManager,
 +    SlidingWindowManager,
 +)
-+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayerConfig
++from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayerConfig, KVCacheSpec
 +
 +from ..configs import Inkling2ModelConfig
 +from .ops.attention import (
@@ -4517,6 +5190,7 @@ index 0000000000..27236da327
 +)
 +from .ops.linear import decode_linear
 +from .ops.sconv import attention_prologue, shift_rel_proj
++from .ops.segment_gemv import segment_gemv
 +from .sconv import K_STREAM, V_STREAM, Inkling2ShortConv, conv_metadata
 +
 +
@@ -4526,6 +5200,17 @@ index 0000000000..27236da327
 +    def __init__(self, *args, **kwargs) -> None:
 +        super().__init__(*args, **kwargs)
 +        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
++
++    @classmethod
++    def get_varlen_cudagraph_max_query_len(
++        cls, vllm_config: VllmConfig, kv_cache_spec: KVCacheSpec
++    ) -> int | None:
++        # The prologue and `rel_decode_attention` read the per-request query
++        # rows from the device `query_start_loc`; the host `max_query_len`
++        # (and so the split plan) is only the graph's per-request bound. This
++        # lets adaptive verification replay a window graph with fewer drafts.
++        del kv_cache_spec
++        return max_decode_query_len(vllm_config)
 +
 +
 +class Inkling2AttentionBackend(FlashAttentionBackend):
@@ -4749,17 +5434,43 @@ index 0000000000..27236da327
 +
 +    def _project(
 +        self, x_q: torch.Tensor, x_k: torch.Tensor, x_v: torch.Tensor
-+    ) -> list[torch.Tensor]:
++    ) -> list[torch.Tensor | None]:
++        """q, r, gate, sinks, k, v and the K/V convs' dynamic taps (None for
++        static convs)."""
 +        weight = self.qkvr.weight
 +        if x_k is x_q and x_v is x_q:
 +            projected = decode_linear(x_q, weight)
-+            return list(projected.split(self.split_sizes, dim=-1)[:6])
++            return [*projected.split(self.split_sizes, dim=-1)[:6], None, None]
 +        q_side, kv_size = sum(self.split_sizes[:4]), self.split_sizes[4]
 +        k_end = q_side + kv_size
-+        projected = decode_linear(x_q, weight[: sum(self.q_side_splits)])
-+        k = decode_linear(x_k, weight[q_side:k_end])
-+        v = decode_linear(x_v, weight[k_end : k_end + kv_size])
-+        return [*projected.split(self.q_side_splits, dim=-1)[:4], k, v]
++        pairs = [
++            (x_q, weight[: sum(self.q_side_splits)]),
++            (x_k, weight[q_side:k_end]),
++            (x_v, weight[k_end : k_end + kv_size]),
++        ]
++        dynamic = self.k_sconv.dynamic and self.k_sconv.dynamic_taps_gemv
++        if dynamic:
++            pairs += [(x_k, self.k_sconv.weight_proj), (x_v, self.v_sconv.weight_proj)]
++        outs = None
++        if (
++            all(
++                x.dim() == 2 and x.shape[0] == 1 and x.stride(-1) == 1
++                for x in (x_k, x_v)
++            )
++            and x_q.shape[0] == 1
++            and x_q.dtype == weight.dtype == torch.bfloat16
++        ):
++            # Batch-1 decode: the layer's GEMVs in one launch.
++            outs = segment_gemv(pairs)
++        if outs is None:
++            outs = [decode_linear(x, w) for x, w in pairs]
++        if not dynamic:
++            outs += [
++                self.k_sconv.dynamic_taps(x_k),
++                self.v_sconv.dynamic_taps(x_v),
++            ]
++        projected, *rest = outs
++        return [*projected.split(self.q_side_splits, dim=-1)[:4], *rest]
 +
 +    def _split_kv_cache(
 +        self, kv_cache: torch.Tensor
@@ -4791,7 +5502,7 @@ index 0000000000..27236da327
 +        if self.is_local and x_k is None:
 +            x_k = x_v = x_q
 +        assert x_k is not None and x_v is not None
-+        q, r, gate, sinks, k, v = self._project(x_q, x_k, x_v)
++        q, r, gate, sinks, k, v, k_dynamic, v_dynamic = self._project(x_q, x_k, x_v)
 +        output = torch.empty(gate.shape, dtype=q.dtype, device=q.device)
 +        self._attention(
 +            positions,
@@ -4801,8 +5512,8 @@ index 0000000000..27236da327
 +            sinks,
 +            k,
 +            v,
-+            self.k_sconv.dynamic_taps(x_k),
-+            self.v_sconv.dynamic_taps(x_v),
++            k_dynamic,
++            v_dynamic,
 +            tau,
 +            output,
 +            pass_idx,
@@ -4926,10 +5637,10 @@ index 0000000000..27236da327
 +        )
 diff --git a/vllm/models/inkling2/amd/dspark.py b/vllm/models/inkling2/amd/dspark.py
 new file mode 100644
-index 0000000000..e11feee8d9
+index 0000000000..ccecb40e25
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/dspark.py
-@@ -0,0 +1,571 @@
+@@ -0,0 +1,636 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Inkling2 DSpark draft (`mtp.safetensors`): an anchor plus mask block run
@@ -4938,6 +5649,7 @@ index 0000000000..e11feee8d9
 +implementation's draft (RMSNorms as flashinfer's, bf16 logits)."""
 +
 +from collections.abc import Iterable
++from dataclasses import replace
 +from typing import cast
 +
 +import torch
@@ -4963,11 +5675,13 @@ index 0000000000..e11feee8d9
 +from vllm.utils.torch_utils import canonicalize_singleton_dim_strides
 +from vllm.v1.attention.backends.flash_attn import (
 +    FlashAttentionBackend,
++    FlashAttentionImpl,
 +    FlashAttentionMetadata,
 +)
 +from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
 +    triton_reshape_and_cache_flash,
 +)
++from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayerConfig
 +
 +from ..configs import Inkling2DSparkConfig
 +from ..speculator_config import Inkling2DSparkSpeculatorConfig
@@ -4981,7 +5695,41 @@ index 0000000000..e11feee8d9
 +    rope_,
 +    silu_and_mul,
 +)
++from .ops.linear import decode_linear
 +from .ops.norm import fused_add_rms_norm, rms_norm
++
++
++class _DraftCacheImpl(FlashAttentionImpl):
++    """The draft layers own their paged cache only: they write and read it
++    with their own Triton kernels, never through this impl, so it also takes
++    the unit-scale FP8 cache that FlashAttention cannot read on ROCm."""
++
++    def __init__(self, *args, **kwargs) -> None:
++        args_list = list(args)
++        kv_cache_dtype = args_list[6]
++        args_list[6] = "auto"
++        super().__init__(*args_list, **kwargs)
++        self.kv_cache_dtype = kv_cache_dtype
++
++
++class _DraftCacheBackend(FlashAttentionBackend):
++    @staticmethod
++    def get_impl_cls() -> type[FlashAttentionImpl]:
++        return _DraftCacheImpl
++
++
++class _DraftAttention(Attention):
++    """A draft layer's paged cache. An FP8 cache keeps the BF16 cache's page
++    (twice the tokens per block): a smaller page would make the planner
++    shrink every page of the target to it."""
++
++    def get_kv_cache_config(self, vllm_config: VllmConfig) -> KVCacheLayerConfig | None:
++        config = super().get_kv_cache_config(vllm_config)
++        if config is None or not self.kv_cache_dtype.startswith("fp8"):
++            return config
++        spec = config.spec
++        assert isinstance(spec, AttentionSpec)
++        return replace(config, spec=replace(spec, block_size=2 * spec.block_size))
 +
 +
 +class _RMSNorm(nn.Module):
@@ -5049,21 +5797,35 @@ index 0000000000..e11feee8d9
 +        self.q_norm = _RMSNorm(self.head_dim, self.eps)
 +        self.k_norm = _RMSNorm(self.head_dim, self.eps)
 +        self.k_norm_ctx = _RMSNorm(self.head_dim, self.eps)
++        # Positions before the block this layer reads: the local window, or
++        # for the global layer the whole context unless `draft_context` caps
++        # it (`speculator_options`; verification stays exact, so a cap only
++        # trades acceptance for KV memory).
++        draft_context = getattr(config, "draft_context", 0) or None
++        # The draft's cache dtype is `speculative_config.kv_cache_dtype`
++        # (BF16 unless unit-scale FP8 is asked for), not the target's.
++        vllm_config = get_current_vllm_config()
++        spec_config = vllm_config.speculative_config
++        cache_config = replace(
++            vllm_config.cache_config,
++            cache_dtype=(spec_config and spec_config.kv_cache_dtype) or "auto",
++        )
++        context = config.sliding_window_size if is_local else draft_context
 +        # Owns the paged KV cache only; the same spec as the target's layers
-+        # (the scheduler keeps the last sliding_window_size positions before
-+        # the block, which is what the draft reads).
-+        self.attn = Attention(
++        # (the scheduler keeps the last `context` positions before the block,
++        # which is what the draft reads).
++        self.attn = _DraftAttention(
 +            self.num_heads,
 +            self.head_dim,
 +            self.head_dim**-0.5,
 +            num_kv_heads=self.num_kv_heads,
-+            per_layer_sliding_window=config.sliding_window_size if is_local else None,
++            per_layer_sliding_window=context,
++            cache_config=cache_config,
 +            prefix=f"{prefix}.attn",
-+            attn_backend=FlashAttentionBackend,
++            attn_backend=_DraftCacheBackend,
 +        )
-+        # Keys a block sees: itself and, if local, the window before it.
-+        self.window = config.sliding_window_size + self.block if is_local else 0
-+        vllm_config = get_current_vllm_config()
++        # Keys a block sees: itself and the `context` before it (0: all).
++        self.window = context + self.block if context else 0
 +        max_num_seqs = vllm_config.scheduler_config.max_num_seqs
 +        self.register_buffer(
 +            "cu_seqlens_q",
@@ -5077,15 +5839,29 @@ index 0000000000..e11feee8d9
 +            return None
 +        return cast(FlashAttentionMetadata, attn_metadata[self.attn.layer_name])
 +
++    def _cache(self) -> torch.Tensor:
++        """The paged `(B, H, N, 2 * D)` K | V cache; an FP8 cache (uint8
++        storage) is viewed as E4M3, which the readers upcast with unit
++        scale."""
++        cache = self.attn.kv_cache
++        if self.attn.kv_cache_dtype.startswith("fp8"):
++            cache = cache.view(torch.float8_e4m3fn)
++        return cache
++
 +    def _write_kv(
 +        self, k: torch.Tensor, v: torch.Tensor, slot_mapping: torch.Tensor
 +    ) -> None:
 +        """Scatter `k`/`v` into the draft cache as the target's layers store
 +        theirs. The FlashAttention impl's write needs upstream flash-attn's
 +        import path, which ROCm lacks, so this calls the Triton store on the
-+        same `(B, H, N, 2 * D)` -> `(B, N, H, D)` K | V views the readers use."""
-+        key_cache, value_cache = self.attn.kv_cache.transpose(1, 2).split(
-+            self.head_dim, dim=-1
++        same `(B, H, N, 2 * D)` -> `(B, N, H, D)` K | V views the readers use.
++        Unit-scale FP8 saturates at the E4M3 range (the store does not)."""
++        if self.attn.kv_cache_dtype.startswith("fp8"):
++            fp8_max = torch.finfo(torch.float8_e4m3fn).max
++            k = k.clamp(-fp8_max, fp8_max)
++            v = v.clamp(-fp8_max, fp8_max)
++        key_cache, value_cache = (
++            self._cache().transpose(1, 2).split(self.head_dim, dim=-1)
 +        )
 +        triton_reshape_and_cache_flash(
 +            k,
@@ -5101,7 +5877,7 @@ index 0000000000..e11feee8d9
 +    def forward(
 +        self, positions: torch.Tensor, x: torch.Tensor, cos_sin_cache: torch.Tensor
 +    ) -> torch.Tensor:
-+        qkv = nn.functional.linear(x, self.qkv_proj.weight)
++        qkv = decode_linear(x, self.qkv_proj.weight)
 +        qk_norm_rope_(
 +            qkv,
 +            positions,
@@ -5121,8 +5897,8 @@ index 0000000000..e11feee8d9
 +                v.view(-1, self.num_kv_heads, self.head_dim),
 +                md.slot_mapping[: q.shape[0]],
 +            )
-+            key_cache, value_cache = self.attn.kv_cache.transpose(1, 2).split(
-+                self.head_dim, dim=-1
++            key_cache, value_cache = (
++                self._cache().transpose(1, 2).split(self.head_dim, dim=-1)
 +            )
 +            num_reqs = min(q.shape[0] // self.block, md.seq_lens.shape[0])
 +            num_tokens = num_reqs * self.block
@@ -5151,7 +5927,7 @@ index 0000000000..e11feee8d9
 +                window=self.window,
 +                num_splits=num_splits,
 +            )
-+        return nn.functional.linear(out, self.o_proj.weight)
++        return decode_linear(out, self.o_proj.weight)
 +
 +    def store_context_kv(
 +        self,
@@ -5160,7 +5936,7 @@ index 0000000000..e11feee8d9
 +        cos_sin_cache: torch.Tensor,
 +        slot_mapping: torch.Tensor | None,
 +    ) -> None:
-+        k, v = nn.functional.linear(context, self.kv_proj_ctx.weight).split(
++        k, v = decode_linear(context, self.kv_proj_ctx.weight).split(
 +            [self.kv_size, self.kv_size], -1
 +        )
 +        k = self.k_norm_ctx(k.reshape(-1, self.head_dim))
@@ -5189,8 +5965,8 @@ index 0000000000..e11feee8d9
 +        )
 +
 +    def forward(self, x: torch.Tensor) -> torch.Tensor:
-+        x = silu_and_mul(nn.functional.linear(x, self.gate_up_proj.weight))
-+        return nn.functional.linear(x, self.down_proj.weight)
++        x = silu_and_mul(decode_linear(x, self.gate_up_proj.weight))
++        return decode_linear(x, self.down_proj.weight)
 +
 +
 +class Inkling2DraftLayer(nn.Module):
@@ -5503,10 +6279,10 @@ index 0000000000..e11feee8d9
 +        return loaded
 diff --git a/vllm/models/inkling2/amd/loop.py b/vllm/models/inkling2/amd/loop.py
 new file mode 100644
-index 0000000000..b11268c34f
+index 0000000000..91d109bcdf
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/loop.py
-@@ -0,0 +1,374 @@
+@@ -0,0 +1,410 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Looped Inkling2 checkpoints (`loop_config`).
@@ -5519,9 +6295,9 @@ index 0000000000..b11268c34f
 +AttnRes read of the previous pass's blocks, merged by a gated low-rank
 +controller.
 +
-+AMD port of `nvidia/loop.py`: each sublayer's short conv runs, then the next
-+AttnRes mix (`Inkling2ShortConv.conv_mix`, unfused: the fused `conv_mix` is a
-+CUDA op), and the TP > 1 fused all-reduce paths are left out.
++AMD port of `nvidia/loop.py`: each sublayer's short conv and the next AttnRes
++mix run as one launch for small batches (`ops.sconv.conv_mix`), and the TP > 1
++fused all-reduce paths are left out.
 +"""
 +
 +from collections.abc import Sequence
@@ -5538,11 +6314,13 @@ index 0000000000..b11268c34f
 +    Inkling2Model,
 +)
 +from .ops.attn_res import attn_res
-+from .ops.linear import gemv, linear_k_groups
-+from .ops.loop import blend_rms_norm, pair_rms_norm
++from .ops.linear import GEMV_ROWS_MAX, gemv, gemv_rows, linear_k_groups
++from .ops.loop import blend_rms_norm, pair_norm_gemv, pair_rms_norm
 +from .quant_config import Inkling2QuantConfig
 +
 +LOOP_STREAMS = ("attn", "k", "v", "mlp")
++# Batches of up to this many tokens mix a pass's messages in one launch.
++PASS_MESSAGES_MAX_TOKENS = 16
 +
 +
 +class Inkling2MessageController(nn.Module):
@@ -5631,14 +6409,20 @@ index 0000000000..b11268c34f
 +        """The `streams` controllers on fp32 `(S, T, D)` `dest` (may
 +        broadcast over streams) and `message`, each output RMS-normalized
 +        with its row of `norm_weight` `(S, D)`: bf16 `(S, T, D)`."""
-+        pair = pair_rms_norm(dest, message)
 +        down = self.controller_down[streams]
 +        gain_forget_weight = self.controller_gain_forget[streams]
-+        if pair.shape[1] == 1:
-+            # Batch-1 decode: one-row GEMVs read the weights faster.
-+            hidden = gemv(pair, down)
++        if message.shape[1] == 1:
++            # Batch-1 decode: one-row GEMVs read the weights faster; the
++            # first also applies the pair's RMSNorm.
++            hidden = pair_norm_gemv(dest, message, down)
 +            gain_forget = gemv(hidden, gain_forget_weight, torch.float32)
++        elif message.shape[1] <= GEMV_ROWS_MAX:
++            # Spec-decode verify windows: each weight read once for all rows.
++            pair = pair_rms_norm(dest, message)
++            hidden = gemv_rows(pair, down)
++            gain_forget = gemv_rows(hidden, gain_forget_weight, torch.float32)
 +        else:
++            pair = pair_rms_norm(dest, message)
 +            hidden = torch.bmm(pair, down.transpose(1, 2))
 +            gain_forget = torch.bmm(
 +                hidden, gain_forget_weight.transpose(1, 2), out_dtype=torch.float32
@@ -5717,34 +6501,24 @@ index 0000000000..b11268c34f
 +        stack: torch.Tensor,
 +        num_blocks: int,
 +        inputs: torch.Tensor | None,
-+        bank: torch.Tensor | None,
++        messages: torch.Tensor | None,
 +        next_query: torch.Tensor,
 +        next_norm: nn.Module | None,
 +        positions: torch.Tensor,
 +        tau: torch.Tensor | None,
 +    ) -> tuple[int, torch.Tensor]:
 +        """Run decoder layer `i` in loop pass `pass_idx` on its `inputs`
-+        (the attention inputs; for a visit with messages from `bank`, the
-+        fp32 mixes they blend into). Returns the number of completed AttnRes
-+        blocks after it and the mixes of its output with `next_query` through
-+        `next_norm` (fp32 without it), the next visit's inputs."""
++        (the attention inputs; for a visit with `messages`, its four
++        streams' fp32 messages, the fp32 mixes they blend into). Returns the
++        number of completed AttnRes blocks after it and the mixes of its
++        output with `next_query` through `next_norm` (fp32 without it), the
++        next visit's inputs."""
 +        layer = self.layers[i]
 +        partial = stack[num_blocks]
 +        owner = layer.conv_states[pass_idx]
-+        messages = None
 +        attn_inputs: Sequence[torch.Tensor]
-+        if bank is not None:
++        if messages is not None:
 +            assert isinstance(layer, Inkling2LoopDecoderLayer) and inputs is not None
-+            # All four streams' messages: a mix of the bank's two blocks.
-+            messages = attn_res(
-+                bank[:1],
-+                bank[1],
-+                None,
-+                self.message_queries[i - self.loop_core.start],
-+                None,
-+                0.0,
-+                True,
-+            )
 +            norm = layer.attn_norm
 +            dests, norm_weight = inputs, norm.weight
 +            if layer.is_local:
@@ -5824,7 +6598,9 @@ index 0000000000..b11268c34f
 +        aux_hidden_states = []
 +        next_norm: nn.Module | None
 +        num_blocks = 0
-+        inputs = bank = prelude_blocks = prelude_partial = prelude_dests = None
++        inputs = prelude_blocks = prelude_partial = prelude_dests = None
++        pass_messages = bank = None
++        num_streams = len(LOOP_STREAMS)
 +        for visit, (i, pass_idx) in enumerate(visits):
 +            looped = pass_idx > 0
 +            if i == core.start and not looped:
@@ -5835,7 +6611,27 @@ index 0000000000..b11268c34f
 +                # previous pass's blocks (after the prelude's) and partial as
 +                # the messages' bank.
 +                assert prelude_blocks is not None and prelude_partial is not None
-+                bank = stack[prelude_blocks + 1 : num_blocks + 1].clone()
++                bank = stack[prelude_blocks + 1 : num_blocks + 1]
++                if num_tokens <= PASS_MESSAGES_MAX_TOKENS:
++                    # Every core layer's four streams' messages, mixes of the
++                    # bank's two blocks, in one launch (each mix as its
++                    # layer's four-query launch would compute it).
++                    pass_messages = attn_res(
++                        bank[:1],
++                        bank[1],
++                        None,
++                        self.message_queries.view(-1, self.hidden_size),
++                        None,
++                        0.0,
++                        True,
++                        select_q=num_streams,
++                    )
++                else:
++                    # Larger batches mix per layer (the pass's messages would
++                    # take 48 fp32 rows per token) from a copy of the bank,
++                    # which the pass overwrites.
++                    pass_messages = None
++                    bank = bank.clone()
 +                num_blocks = prelude_blocks
 +                stack[num_blocks].copy_(prelude_partial)
 +                if prelude_dests is None:
@@ -5859,13 +6655,29 @@ index 0000000000..b11268c34f
 +                next_query = self.attn_res.attn_queries[next_i - 1]
 +                # Messages blend into fp32 mixes; a pass restart discards it.
 +                next_norm = None if next_pass else self.layers[next_i].attn_norm
++            messages = None
++            if looped and pass_messages is not None:
++                j = (i - core.start) * num_streams
++                messages = pass_messages[j : j + num_streams]
++            elif looped:
++                assert bank is not None
++                # This layer's four streams' messages.
++                messages = attn_res(
++                    bank[:1],
++                    bank[1],
++                    None,
++                    self.message_queries[i - core.start],
++                    None,
++                    0.0,
++                    True,
++                )
 +            num_blocks, inputs = self._run_layer(
 +                i,
 +                pass_idx,
 +                stack,
 +                num_blocks,
 +                inputs,
-+                bank if looped else None,
++                messages,
 +                next_query,
 +                next_norm,
 +                positions,
@@ -6940,10 +7752,10 @@ index 0000000000..59cb807b11
 +    return values, scales
 diff --git a/vllm/models/inkling2/amd/ops/attention.py b/vllm/models/inkling2/amd/ops/attention.py
 new file mode 100644
-index 0000000000..7951d4d54c
+index 0000000000..3498504479
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/ops/attention.py
-@@ -0,0 +1,731 @@
+@@ -0,0 +1,1089 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Inkling2 attention kernels: paged relative attention (and the DSpark
@@ -6953,7 +7765,11 @@ index 0000000000..7951d4d54c
 +the query heads of one KV head (rows token-major), and walks the request's
 +keys from its first query's window (local layers) or the start (full layers)
 +to its last query. Decode and verify batches split those keys over several
-+programs (split-KV) and merge the partial outputs in a second launch.
++programs (split-KV) and merge the partial outputs in a second launch. On
++gfx12, prefill launches take `_rel_prefill_kernel`: the same math with the
++GQA group packed without padding rows, unmasked steps over the keys that
++every row sees without a relative logit, and FP8 KV decoded with integer
++ops.
 +"""
 +
 +import functools
@@ -6963,6 +7779,8 @@ index 0000000000..7951d4d54c
 +
 +from vllm.triton_utils import tl, tldevice, triton
 +from vllm.utils.platform_utils import num_compute_units
++
++from .nvfp4_moe import _e4m3_to_f16
 +
 +_LOG2E = 1.4426950408889634
 +_BLOCK_N = 64
@@ -7000,6 +7818,18 @@ index 0000000000..7951d4d54c
 +_GFX12_DECODE = DecodeConfig(
 +    programs_per_cu=4, max_splits=128, block_n=32, num_warps=4, num_stages=1
 +)
++
++
++@functools.cache
++def _use_prefill_kernel() -> bool:
++    """`_rel_prefill_kernel` (tuned on gfx12) for prefill launches."""
++    from vllm.platforms import current_platform
++
++    if not current_platform.is_rocm():
++        return False
++    from vllm.platforms.rocm import on_gfx12x
++
++    return on_gfx12x()
 +
 +
 +@functools.cache
@@ -7169,6 +7999,253 @@ index 0000000000..7951d4d54c
 +        if not SPLIT:
 +            lse *= 0.6931471805599453
 +        tl.store(Lse + head * stride_lh + out_token, lse, row_valid)
++
++
++@triton.jit
++def _load_kv(ptrs, mask, dtype: tl.constexpr, D: tl.constexpr, MASKED: tl.constexpr):
++    """[BLOCK_N, D] keys or values at `ptrs` (row starts) in `dtype`. FP8
++    (unit-scale e4m3) caches are read as byte pairs and decoded exactly
++    with integer ops (2^-8 times the value in fp16, then fp32 times 2^8,
++    truncated to bf16), much faster on gfx12 than Triton's conversions."""
++    if ptrs.dtype.element_ty == tl.float8e4nv:
++        pairs = (
++            ptrs.to(tl.pointer_type(tl.uint16))[:, None] + tl.arange(0, D // 2)[None, :]
++        )
++        x = tl.load(pairs, mask[:, None], other=0) if MASKED else tl.load(pairs)
++        f32 = _e4m3_to_f16(x, ptrs.shape[0], D // 2).to(tl.float32) * 256.0
++        if dtype == tl.bfloat16:
++            # Exact in bf16 (4 significant bits): truncate, no rounding.
++            bits = f32.to(tl.uint32, bitcast=True) >> 16
++            return bits.to(tl.uint16).to(tl.bfloat16, bitcast=True)
++        return f32.to(dtype)
++    d = tl.arange(0, D)
++    if MASKED:
++        return tl.load(ptrs[:, None] + d[None, :], mask[:, None], other=0.0).to(dtype)
++    return tl.load(ptrs[:, None] + d[None, :]).to(dtype)
++
++
++@triton.jit
++def _attend_block(
++    q,
++    K,
++    V,
++    table,
++    keys,
++    kv_head,
++    m_i,
++    l_i,
++    acc,
++    scale_log2,
++    bias_rows,
++    pos,
++    row_valid,
++    key0,
++    hi,
++    stride_kb,
++    stride_kp,
++    stride_kh,
++    stride_vb,
++    stride_vp,
++    stride_vh,
++    D: tl.constexpr,
++    PAGE: tl.constexpr,
++    WINDOW: tl.constexpr,
++    MASKED: tl.constexpr,
++):
++    """One online-softmax step of a prefill program over the key block
++    `keys`. Without `MASKED`, every key is visible to every row and has no
++    relative logit (and is below `hi`)."""
++    key_valid = keys < hi
++    if MASKED:
++        page = tl.load(table + keys // PAGE, key_valid, other=0).to(tl.int64)
++    else:
++        page = tl.load(table + keys // PAGE).to(tl.int64)
++    slot = keys % PAGE
++    k_rows = K + page * stride_kb + slot * stride_kp + kv_head * stride_kh
++    v_rows = V + page * stride_vb + slot * stride_vp + kv_head * stride_vh
++    k = _load_kv(k_rows, key_valid, q.dtype, D, MASKED)
++    s = tl.dot(q, tl.trans(k)) * scale_log2
++    if MASKED:
++        dist = pos[:, None] - keys[None, :]
++        valid = row_valid[:, None] & key_valid[None, :] & (dist >= 0)
++        if WINDOW >= 0:
++            valid &= dist <= WINDOW
++        # Keys before key0 are past the extent: no bias (full layers) or
++        # out of the window.
++        in_table = valid & (keys[None, :] >= key0[:, None])
++        bias = tl.load(bias_rows[:, None] + keys[None, :], in_table, other=0.0)
++        s = s + bias.to(tl.float32) * 1.4426950408889634
++        s = tl.where(valid, s, float("-inf"))
++    m_new = tl.maximum(m_i, tl.max(s, 1))
++    # Rows without a live key so far keep m = -inf: no -inf - -inf.
++    m_ref = tl.where(m_new == float("-inf"), 0.0, m_new)
++    alpha = tl.math.exp2(m_i - m_ref)
++    p = tl.math.exp2(s - m_ref[:, None])
++    l_i = l_i * alpha + tl.sum(p, 1)
++    v = _load_kv(v_rows, key_valid, q.dtype, D, MASKED)
++    if v.dtype == tl.bfloat16:
++        # Round to nearest even like `.to(tl.bfloat16)`, without its NaN
++        # case (p is finite): fewer integer ops on gfx12.
++        bits = p.to(tl.uint32, bitcast=True)
++        bits = (bits + (0x7FFF + ((bits >> 16) & 1))) >> 16
++        p_mma = bits.to(tl.uint16).to(tl.bfloat16, bitcast=True)
++    else:
++        p_mma = p.to(v.dtype)
++    acc = acc * alpha[:, None] + tl.dot(p_mma, v)
++    return m_new, l_i, acc
++
++
++@triton.jit
++def _rel_prefill_kernel(
++    Q,
++    K,
++    V,
++    Bias,
++    Out,
++    Lse,
++    BlockTable,
++    SeqLens,
++    CuSeqlensQ,
++    scale_log2,
++    stride_qt,
++    stride_qh,
++    stride_kb,
++    stride_kp,
++    stride_kh,
++    stride_vb,
++    stride_vp,
++    stride_vh,
++    stride_bt,
++    stride_bh,
++    stride_ot,
++    stride_oh,
++    stride_lh,
++    stride_table,
++    GROUP: tl.constexpr,
++    D: tl.constexpr,
++    PAGE: tl.constexpr,
++    E_PAD: tl.constexpr,
++    WINDOW: tl.constexpr,
++    BLOCK_M: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++):
++    # `_rel_attention_kernel` (not split, not draft) for prefill chunks. A
++    # program owns BLOCK_M // GROUP query tokens of one request and the GROUP
++    # query heads of one KV head (row r: token r // GROUP, head r % GROUP),
++    # so no rows are padding when GROUP is not a power of two. Key blocks
++    # that every row sees and that are before every row's relative-logit
++    # table (full layers: all but the last E_PAD + BLOCK_M // GROUP keys)
++    # take an unmasked step without the bias; the rest the masked one.
++    BLOCK_Q: tl.constexpr = BLOCK_M // GROUP
++    kv_head = tl.program_id(1)
++    req = tl.program_id(2)
++    q_start = tl.load(CuSeqlensQ + req)
++    q_len = tl.load(CuSeqlensQ + req + 1) - q_start
++    q0 = tl.program_id(0) * BLOCK_Q
++    if q0 >= q_len:
++        return
++    seq_len = tl.load(SeqLens + req)
++    past = seq_len - q_len
++
++    rows = tl.arange(0, BLOCK_M)
++    q_idx = q0 + rows // GROUP
++    head = kv_head * GROUP + rows % GROUP
++    row_valid = (q_idx < q_len) & (rows < BLOCK_Q * GROUP)
++    token = (q_start + q_idx).to(tl.int64)
++    d = tl.arange(0, D)
++    q = tl.load(
++        Q + token[:, None] * stride_qt + head[:, None] * stride_qh + d[None, :],
++        row_valid[:, None],
++        other=0.0,
++    )
++    pos = past + q_idx
++    first_pos = past + q0
++    hi = tl.minimum(past + q0 + BLOCK_Q, seq_len)
++    # Sheared column of key j is j - key0: key0 starts the E_PAD keys
++    # ending at the key blocks of the token's 128-token query tile.
++    tile_end = tl.minimum((q_idx // 128 + 1) * 128, q_len)
++    key0 = tl.cdiv(past + tile_end, 128) * 128 - E_PAD
++    bias_rows = Bias + token * stride_bt + head * stride_bh - key0
++    table = BlockTable + req * stride_table
++    m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
++    l_i = tl.zeros([BLOCK_M], tl.float32)
++    acc = tl.zeros([BLOCK_M, D], tl.float32)
++    if WINDOW >= 0:
++        lo = tl.maximum(first_pos - WINDOW, 0) // BLOCK_N * BLOCK_N
++        far_end = lo
++    else:
++        lo = 0
++        # The first row has the smallest key0 (and position).
++        first_end = tl.minimum((q0 // 128 + 1) * 128, q_len)
++        key0_min = tl.cdiv(past + first_end, 128) * 128 - E_PAD
++        far_end = tl.maximum(tl.minimum(key0_min, first_pos + 1), 0)
++        far_end = far_end // BLOCK_N * BLOCK_N
++    for start in range(lo, far_end, BLOCK_N):
++        m_i, l_i, acc = _attend_block(
++            q,
++            K,
++            V,
++            table,
++            start + tl.arange(0, BLOCK_N),
++            kv_head,
++            m_i,
++            l_i,
++            acc,
++            scale_log2,
++            bias_rows,
++            pos,
++            row_valid,
++            key0,
++            hi,
++            stride_kb,
++            stride_kp,
++            stride_kh,
++            stride_vb,
++            stride_vp,
++            stride_vh,
++            D,
++            PAGE,
++            WINDOW,
++            False,
++        )
++    for start in range(far_end, hi, BLOCK_N):
++        m_i, l_i, acc = _attend_block(
++            q,
++            K,
++            V,
++            table,
++            start + tl.arange(0, BLOCK_N),
++            kv_head,
++            m_i,
++            l_i,
++            acc,
++            scale_log2,
++            bias_rows,
++            pos,
++            row_valid,
++            key0,
++            hi,
++            stride_kb,
++            stride_kp,
++            stride_kh,
++            stride_vb,
++            stride_vp,
++            stride_vh,
++            D,
++            PAGE,
++            WINDOW,
++            True,
++        )
++
++    has_keys = l_i > 0.0
++    out = acc / tl.where(has_keys, l_i, 1.0)[:, None]
++    tl.store(
++        Out + token[:, None] * stride_ot + head[:, None] * stride_oh + d[None, :],
++        out.to(Out.dtype.element_ty),
++        row_valid[:, None],
++    )
++    lse = tl.where(has_keys, m_i + tl.math.log2(l_i), float("-inf"))
++    tl.store(Lse + head * stride_lh + token, lse * 0.6931471805599453, row_valid)
 +
 +
 +def rel_attention(
@@ -7432,6 +8509,22 @@ index 0000000000..7951d4d54c
 +    assert out.stride(2) == 1
 +    if num_tokens == 0:
 +        return out, lse
++    if not split and not draft and _use_prefill_kernel():
++        _launch_prefill(
++            q,
++            key_cache,
++            value_cache,
++            bias,
++            out,
++            lse,
++            block_table,
++            cache_seqlens,
++            cu_seqlens_q,
++            max_seqlen_q,
++            softmax_scale,
++            window,
++        )
++        return out, lse
 +    _rel_attention_kernel[grid](
 +        q,
 +        key_cache,
@@ -7473,6 +8566,83 @@ index 0000000000..7951d4d54c
 +        num_stages=num_stages,
 +    )
 +    return out, lse
++
++
++def _prefill_config(
++    max_seqlen_q: int, group: int, window: int, fp8: bool
++) -> tuple[int, int, int, int]:
++    """(BLOCK_M, BLOCK_N, num_warps, num_stages) of `_rel_prefill_kernel`,
++    fitted on the R9700 (gfx1201) for 2048-query chunks after 0 to 62K keys:
++    6.2x the speed of `_rel_attention_kernel` at 62K keys with FP8 KV, 2.3x
++    at 16K with BF16."""
++    block_m = min(64, max(16, triton.next_power_of_2(max_seqlen_q * group)))
++    if window >= 0:
++        return block_m, 32, 4, 1
++    # Full layers: FP8 KV (decoded in registers) wants two stages of short
++    # key blocks, BF16 KV one stage of 64-key blocks.
++    return (block_m, 32, 4, 2) if fp8 else (block_m, 64, 4, 1)
++
++
++def _launch_prefill(
++    q: torch.Tensor,
++    key_cache: torch.Tensor,
++    value_cache: torch.Tensor,
++    bias: torch.Tensor,
++    out: torch.Tensor,
++    lse: torch.Tensor,
++    block_table: torch.Tensor,
++    cache_seqlens: torch.Tensor,
++    cu_seqlens_q: torch.Tensor,
++    max_seqlen_q: int,
++    softmax_scale: float,
++    window: int,
++) -> None:
++    num_heads, head_dim = q.shape[1:]
++    page, num_kv_heads = key_cache.shape[1:3]
++    group = num_heads // num_kv_heads
++    block_m, block_n, num_warps, num_stages = _prefill_config(
++        max_seqlen_q, group, window, key_cache.dtype == torch.float8_e4m3fn
++    )
++    grid = (
++        triton.cdiv(max_seqlen_q, block_m // group),
++        num_kv_heads,
++        cache_seqlens.shape[0],
++    )
++    _rel_prefill_kernel[grid](
++        q,
++        key_cache,
++        value_cache,
++        bias,
++        out,
++        lse,
++        block_table,
++        cache_seqlens,
++        cu_seqlens_q,
++        softmax_scale * _LOG2E,
++        q.stride(0),
++        q.stride(1),
++        key_cache.stride(0),
++        key_cache.stride(1),
++        key_cache.stride(2),
++        value_cache.stride(0),
++        value_cache.stride(1),
++        value_cache.stride(2),
++        bias.stride(0),
++        bias.stride(1),
++        out.stride(0),
++        out.stride(1),
++        lse.stride(0),
++        block_table.stride(0),
++        GROUP=group,
++        D=head_dim,
++        PAGE=page,
++        E_PAD=bias.shape[2],
++        WINDOW=window,
++        BLOCK_M=block_m,
++        BLOCK_N=block_n,
++        num_warps=num_warps,
++        num_stages=num_stages,
++    )
 +
 +
 +@triton.jit(do_not_specialize=["num_reqs", "num_splits", "num_tokens"])
@@ -7677,10 +8847,10 @@ index 0000000000..7951d4d54c
 +    return output
 diff --git a/vllm/models/inkling2/amd/ops/attn_res.py b/vllm/models/inkling2/amd/ops/attn_res.py
 new file mode 100644
-index 0000000000..da7ccb5d65
+index 0000000000..e70702f6f6
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/ops/attn_res.py
-@@ -0,0 +1,302 @@
+@@ -0,0 +1,380 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Block attention residual: softmax-weighted mix of residual stream blocks.
@@ -7700,11 +8870,29 @@ index 0000000000..da7ccb5d65
 +
 +@triton.jit
 +def _load_source(
-+    Stack, stride_s, Last, Addend, row_off, offs, mask, n, N_STACK, HAS_ADDEND
++    Stack,
++    stride_s,
++    Last,
++    Addend,
++    row_off,
++    offs,
++    mask,
++    n,
++    N_STACK,
++    HAS_ADDEND,
++    LAST_CG: tl.constexpr = False,
 +):
++    # LAST_CG: `Last` / `Addend` were just written by this program (the fused
++    # conv + mix), so read them past the per-CU cache.
 +    if n < N_STACK:
 +        x = tl.load(Stack + n * stride_s + row_off + offs, mask, other=0)
 +        x = x.to(tl.float32)
++    elif LAST_CG:
++        x = tl.load(Last + row_off + offs, mask, other=0, cache_modifier=".cg")
++        x = x.to(tl.float32)
++        if HAS_ADDEND:
++            a = tl.load(Addend + row_off + offs, mask, other=0, cache_modifier=".cg")
++            x = x + a.to(tl.float32)
 +    else:
 +        x = tl.load(Last + row_off + offs, mask, other=0).to(tl.float32)
 +        if HAS_ADDEND:
@@ -7849,6 +9037,81 @@ index 0000000000..da7ccb5d65
 +
 +
 +@triton.jit
++def _row_mix(
++    Stack,
++    Last,
++    Addend,
++    Queries,
++    NormW,
++    Out,
++    stride_s,
++    T,
++    eps,
++    norm_eps,
++    t,
++    q,
++    D: tl.constexpr,
++    N_STACK: tl.constexpr,
++    HAS_ADDEND: tl.constexpr,
++    NORMALIZE: tl.constexpr,
++    APPLY_NORM: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    BLOCK_A: tl.constexpr,
++    BLOCK_B: tl.constexpr,
++    LAST_CG: tl.constexpr = False,
++):
++    """The mix of token `t` with query `q`: the row in registers as a
++    power-of-2 head [0, BLOCK_A) and a masked tail [BLOCK_A, D), so the
++    sources are read twice instead of three times."""
++    q_off = q * D
++    row_off = t * D
++    da = tl.arange(0, BLOCK_A)
++    db = BLOCK_A + tl.arange(0, BLOCK_B)
++    mask_a = da < D
++    mask_b = db < D
++    n_idx = tl.arange(0, BLOCK_N)
++    qa = tl.load(Queries + q_off + da, mask_a, other=0)
++    qb = tl.load(Queries + q_off + db, mask_b, other=0)
++    src = (Stack, stride_s, Last, Addend, row_off)
++
++    logits = tl.full((BLOCK_N,), float("-inf"), tl.float32)
++    inv_rms = tl.zeros((BLOCK_N,), tl.float32)
++    for n in tl.static_range(N_STACK + 1):
++        xa = _load_source(*src, da, mask_a, n, N_STACK, HAS_ADDEND, LAST_CG)
++        xb = _load_source(*src, db, mask_b, n, N_STACK, HAS_ADDEND, LAST_CG)
++        rstd = tl.rsqrt(tl.fma(tl.sum(xa * xa) + tl.sum(xb * xb), 1.0 / D, eps))
++        inv_rms = tl.where(n_idx == n, rstd, inv_rms)
++        dot = tl.sum(qa * xa) + tl.sum(qb * xb)
++        logits = tl.where(n_idx == n, dot * rstd, logits)
++
++    probs = tldevice.exp(logits - tl.max(logits))
++    inv_sum = tl.div_rn(1.0, tl.sum(probs))
++    if NORMALIZE:
++        probs = probs * inv_rms
++
++    acc_a = tl.zeros((BLOCK_A,), tl.float32)
++    acc_b = tl.zeros((BLOCK_B,), tl.float32)
++    for n in tl.static_range(N_STACK + 1):
++        p = tl.sum(tl.where(n_idx == n, probs, 0.0))
++        xa = _load_source(*src, da, mask_a, n, N_STACK, HAS_ADDEND, LAST_CG)
++        xb = _load_source(*src, db, mask_b, n, N_STACK, HAS_ADDEND, LAST_CG)
++        acc_a = tl.fma(p, xa, acc_a)
++        acc_b = tl.fma(p, xb, acc_b)
++    acc_a = acc_a * inv_sum
++    acc_b = acc_b * inv_sum
++    out = Out + tl.cast(q, tl.int64) * T * D + row_off
++    if APPLY_NORM:
++        sum_sq = tl.sum(acc_a * acc_a) + tl.sum(acc_b * acc_b)
++        out_rstd = tl.rsqrt(tl.div_rn(sum_sq, D) + norm_eps)
++        wa = tl.load(NormW + q_off + da, mask_a, other=0).to(tl.float32)
++        wb = tl.load(NormW + q_off + db, mask_b, other=0).to(tl.float32)
++        acc_a = acc_a * out_rstd * wa
++        acc_b = acc_b * out_rstd * wb
++    tl.store(out + da, acc_a.to(Out.dtype.element_ty), mask_a)
++    tl.store(out + db, acc_b.to(Out.dtype.element_ty), mask_b)
++
++
++@triton.jit
 +def _attn_res_row_kernel(
 +    Stack,
 +    Last,
@@ -7869,56 +9132,39 @@ index 0000000000..da7ccb5d65
 +    BLOCK_A: tl.constexpr,
 +    BLOCK_B: tl.constexpr,
 +):
-+    # Small batches: one program per (token, query) holds the row in registers
-+    # as a power-of-2 head [0, BLOCK_A) and a masked tail [BLOCK_A, D), so the
-+    # sources are read twice instead of three times.
-+    t = tl.program_id(1).to(tl.int64)
-+    q_off = tl.program_id(0) * D
-+    row_off = t * D
-+    da = tl.arange(0, BLOCK_A)
-+    db = BLOCK_A + tl.arange(0, BLOCK_B)
-+    mask_a = da < D
-+    mask_b = db < D
-+    n_idx = tl.arange(0, BLOCK_N)
-+    qa = tl.load(Queries + q_off + da, mask_a, other=0)
-+    qb = tl.load(Queries + q_off + db, mask_b, other=0)
-+    src = (Stack, stride_s, Last, Addend, row_off)
++    # Small batches: one program per (token, query).
++    _row_mix(
++        Stack,
++        Last,
++        Addend,
++        Queries,
++        NormW,
++        Out,
++        stride_s,
++        T,
++        eps,
++        norm_eps,
++        tl.program_id(1).to(tl.int64),
++        tl.program_id(0),
++        D,
++        N_STACK,
++        HAS_ADDEND,
++        NORMALIZE,
++        APPLY_NORM,
++        BLOCK_N,
++        BLOCK_A,
++        BLOCK_B,
++    )
 +
-+    logits = tl.full((BLOCK_N,), float("-inf"), tl.float32)
-+    inv_rms = tl.zeros((BLOCK_N,), tl.float32)
-+    for n in tl.static_range(N_STACK + 1):
-+        xa = _load_source(*src, da, mask_a, n, N_STACK, HAS_ADDEND)
-+        xb = _load_source(*src, db, mask_b, n, N_STACK, HAS_ADDEND)
-+        rstd = tl.rsqrt(tl.fma(tl.sum(xa * xa) + tl.sum(xb * xb), 1.0 / D, eps))
-+        inv_rms = tl.where(n_idx == n, rstd, inv_rms)
-+        dot = tl.sum(qa * xa) + tl.sum(qb * xb)
-+        logits = tl.where(n_idx == n, dot * rstd, logits)
 +
-+    probs = tldevice.exp(logits - tl.max(logits))
-+    inv_sum = tl.div_rn(1.0, tl.sum(probs))
-+    if NORMALIZE:
-+        probs = probs * inv_rms
++def row_blocks(d: int) -> tuple[int, int]:
++    """`(BLOCK_A, BLOCK_B)` of the row kernel: a power-of-2 head and tail."""
++    block_a = triton.next_power_of_2(d + 1) // 2
++    return block_a, max(triton.next_power_of_2(d - block_a), 16)
 +
-+    acc_a = tl.zeros((BLOCK_A,), tl.float32)
-+    acc_b = tl.zeros((BLOCK_B,), tl.float32)
-+    for n in tl.static_range(N_STACK + 1):
-+        p = tl.sum(tl.where(n_idx == n, probs, 0.0))
-+        xa = _load_source(*src, da, mask_a, n, N_STACK, HAS_ADDEND)
-+        xb = _load_source(*src, db, mask_b, n, N_STACK, HAS_ADDEND)
-+        acc_a = tl.fma(p, xa, acc_a)
-+        acc_b = tl.fma(p, xb, acc_b)
-+    acc_a = acc_a * inv_sum
-+    acc_b = acc_b * inv_sum
-+    out = Out + tl.program_id(0).to(tl.int64) * T * D + row_off
-+    if APPLY_NORM:
-+        sum_sq = tl.sum(acc_a * acc_a) + tl.sum(acc_b * acc_b)
-+        out_rstd = tl.rsqrt(tl.div_rn(sum_sq, D) + norm_eps)
-+        wa = tl.load(NormW + q_off + da, mask_a, other=0).to(tl.float32)
-+        wb = tl.load(NormW + q_off + db, mask_b, other=0).to(tl.float32)
-+        acc_a = acc_a * out_rstd * wa
-+        acc_b = acc_b * out_rstd * wb
-+    tl.store(out + da, acc_a.to(Out.dtype.element_ty), mask_a)
-+    tl.store(out + db, acc_b.to(Out.dtype.element_ty), mask_b)
++
++# The row kernel serves batches of up to this many (token, query) programs.
++ROW_MAX_PROGRAMS = 256
 +
 +
 +def attn_res(
@@ -7930,12 +9176,15 @@ index 0000000000..da7ccb5d65
 +    norm_eps: float,
 +    normalize_values: bool,
 +    eps: float = 1e-6,
++    select_q: int | None = None,
 +) -> torch.Tensor:
 +    """Mix `[*stack, last (+ addend)]` with each pseudo-query.
 +
 +    `queries` are fp32 `(Q, D)`, already scaled by `D**-0.5`; each fp32
 +    mix is RMS-normalized with its row of `norm_weight` `(Q, D)`. Returns
 +    `(Q, T, D)` in `last.dtype`, or the fp32 mixes without `norm_weight`.
++    `select_q` picks the kernel as for that many queries (a launch batching
++    several mixes keeps their unbatched kernel, hence their rounding).
 +    """
 +    num_tokens, d = last.shape
 +    num_stack = stack.shape[0]
@@ -7974,9 +9223,8 @@ index 0000000000..da7ccb5d65
 +    )
 +    # The queries of a token run back to back and share its sources in L2.
 +    grid = (num_q, num_tokens)
-+    if num_tokens * num_q <= 256:
-+        block_a = triton.next_power_of_2(d + 1) // 2
-+        block_b = max(triton.next_power_of_2(d - block_a), 16)
++    if num_tokens * (select_q or num_q) <= ROW_MAX_PROGRAMS:
++        block_a, block_b = row_blocks(d)
 +        _attn_res_row_kernel[grid](
 +            *args, **meta, BLOCK_A=block_a, BLOCK_B=block_b, num_warps=8
 +        )
@@ -8259,10 +9507,10 @@ index 0000000000..74d45727b9
 +    return logits.masked_fill(logits.isnan(), float("-inf")).argmax(-1)
 diff --git a/vllm/models/inkling2/amd/ops/linear.py b/vllm/models/inkling2/amd/ops/linear.py
 new file mode 100644
-index 0000000000..325a25856d
+index 0000000000..b1e237c5ac
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/ops/linear.py
-@@ -0,0 +1,242 @@
+@@ -0,0 +1,361 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""bf16 linears as the reference `linear`: fp32 accumulation in ordered
@@ -8440,7 +9688,9 @@ index 0000000000..325a25856d
 +    for k0 in tl.static_range(0, K, BK):
 +        ks = k0 + tl.arange(0, BK)
 +        x = tl.load(X + s * stride_xs + ks, ks < K, other=0)
-+        w = tl.load(w_rows + ks[None, :], (rows[:, None] < N) & (ks[None, :] < K), other=0)
++        w = tl.load(
++            w_rows + ks[None, :], (rows[:, None] < N) & (ks[None, :] < K), other=0
++        )
 +        acc += w.to(tl.float32) * x.to(tl.float32)[None, :]
 +    tl.store(Y + s * stride_ys + rows, tl.sum(acc, 1).to(Y.dtype.element_ty), rows < N)
 +
@@ -8472,9 +9722,7 @@ index 0000000000..325a25856d
 +    streams, n, k = weight.shape
 +    assert x.shape == (streams, 1, k), (x.shape, weight.shape)
 +    assert x.stride(-1) == 1 and weight.stride(-1) == 1
-+    out = torch.empty(
-+        (streams, 1, n), dtype=out_dtype or x.dtype, device=x.device
-+    )
++    out = torch.empty((streams, 1, n), dtype=out_dtype or x.dtype, device=x.device)
 +    bn, bk, num_warps = _gemv_config(streams, n, k)
 +    _gemv_kernel[(triton.cdiv(n, bn), streams)](
 +        x,
@@ -8493,24 +9741,143 @@ index 0000000000..325a25856d
 +    return out if batched else out[0]
 +
 +
++@triton.jit
++def _gemv_rows_kernel(
++    X,
++    W,
++    Y,
++    M,
++    N,
++    stride_xs,
++    stride_xm,
++    stride_ws,
++    stride_wn,
++    stride_ys,
++    stride_ym,
++    K: tl.constexpr,
++    BM: tl.constexpr,
++    BN: tl.constexpr,
++    BK: tl.constexpr,
++    MODE: tl.constexpr,
++):
++    # One program: BN output columns of one stream for all M (<= BM) rows,
++    # each weight tile read once. MODE 0: matrix cores (BM >= 16); 1: fp32
++    # FMAs over a (BM, BN, BK) product reduced per chunk; 2: fp32 FMAs kept
++    # per lane and summed once at the end (`gemv`'s order, per row).
++    s = tl.program_id(1).to(tl.int64)
++    cols = tl.program_id(0) * BN + tl.arange(0, BN)
++    rows = tl.arange(0, BM)
++    w_rows = W + s * stride_ws + cols[:, None].to(tl.int64) * stride_wn
++    x_rows = X + s * stride_xs + rows[:, None] * stride_xm
++    if MODE == 2:
++        acc3 = tl.zeros((BM, BN, BK), tl.float32)
++    else:
++        acc = tl.zeros((BM, BN), tl.float32)
++    for k0 in range(0, K, BK):
++        ks = k0 + tl.arange(0, BK)
++        x = tl.load(
++            x_rows + ks[None, :], (rows[:, None] < M) & (ks[None, :] < K), other=0
++        )
++        w = tl.load(
++            w_rows + ks[None, :], (cols[:, None] < N) & (ks[None, :] < K), other=0
++        )
++        if MODE == 0:
++            acc = tl.dot(x, tl.trans(w), acc)
++        elif MODE == 1:
++            acc += tl.sum(
++                x.to(tl.float32)[:, None, :] * w.to(tl.float32)[None, :, :], 2
++            )
++        else:
++            acc3 += w.to(tl.float32)[None, :, :] * x.to(tl.float32)[:, None, :]
++    if MODE == 2:
++        acc = tl.sum(acc3, 2)
++    tl.store(
++        Y + s * stride_ys + rows[:, None] * stride_ym + cols[None, :],
++        acc.to(Y.dtype.element_ty),
++        (rows[:, None] < M) & (cols[None, :] < N),
++    )
++
++
++GEMV_ROWS_MAX = 16
++
++
++def _gemv_rows_config(
++    streams: int, m: int, n: int, k: int
++) -> tuple[int, int, int, int, int]:
++    """(BM, BN, BK, mode, num_warps) for 2..16-row GEMVs on gfx12 (64 CUs),
++    from `s1_bench_rows2.py` sweeps at M=8 (HIP graph over cold weights)."""
++    if k <= 128:
++        # Controller up-projections (K = rank 64): matrix cores, whole K.
++        return 16, 16, triton.next_power_of_2(k), 0, 4
++    if n <= 256:
++        # Controller down-projections (N = rank 64, K = 4608): too few
++        # columns for 16-wide tiles; fp32 FMAs on a few columns per program.
++        bm = triton.next_power_of_2(m)
++        return bm, 1 if streams == 1 else 2, 512 if bm <= 8 else 256, 2, 8
++    # Wide projections: 64 columns per program on matrix cores (~590 GB/s).
++    return 16, 64, 256 if k % 256 == 0 and k >= 3072 else 128, 0, 4
++
++
++def gemv_rows(
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    out_dtype: torch.dtype | None = None,
++    config: tuple[int, int, int, int, int] | None = None,
++) -> torch.Tensor:
++    """`x @ weight.T` for a few (2..16) rows per stream: spec-decode verify
++    windows. `x` is bf16 `(S, M, K)` with `weight` `(S, N, K)`, or `(M, K)`
++    with `(N, K)`; fp32 accumulation, each weight element read once."""
++    batched = weight.dim() == 3
++    if not batched:
++        x, weight = x.unsqueeze(0), weight.unsqueeze(0)
++    streams, n, k = weight.shape
++    m = x.shape[1]
++    assert x.shape == (streams, m, k) and m <= GEMV_ROWS_MAX, (x.shape, weight.shape)
++    assert x.stride(-1) == 1 and weight.stride(-1) == 1
++    out = torch.empty((streams, m, n), dtype=out_dtype or x.dtype, device=x.device)
++    bm, bn, bk, mode, num_warps = config or _gemv_rows_config(streams, m, n, k)
++    _gemv_rows_kernel[(triton.cdiv(n, bn), streams)](
++        x,
++        weight,
++        out,
++        m,
++        n,
++        x.stride(0),
++        x.stride(1),
++        weight.stride(0),
++        weight.stride(1),
++        out.stride(0),
++        out.stride(1),
++        k,
++        bm,
++        bn,
++        bk,
++        mode,
++        num_warps=num_warps,
++    )
++    return out if batched else out[0]
++
++
 +def decode_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-+    """`nn.functional.linear(x, weight)` (no bias); one-row bf16 inputs (batch-1
-+    decode) take `gemv`, which reads the weight faster than hipBLASLt there."""
++    """`nn.functional.linear(x, weight)` (no bias). bf16 decode inputs take
++    the Triton GEMVs, which read the weight faster than hipBLASLt there: one
++    row (batch-1 decode) `gemv`, 2..16 rows (spec-decode verify windows)
++    `gemv_rows`; prefill stays on hipBLASLt."""
 +    if (
 +        x.dim() == 2
-+        and x.shape[0] == 1
++        and 1 <= x.shape[0] <= GEMV_ROWS_MAX
 +        and x.dtype == weight.dtype == torch.bfloat16
 +        and x.stride(-1) == 1
 +        and weight.stride(-1) == 1
 +    ):
-+        return gemv(x, weight)
++        return gemv(x, weight) if x.shape[0] == 1 else gemv_rows(x, weight)
 +    return torch.nn.functional.linear(x, weight)
 diff --git a/vllm/models/inkling2/amd/ops/loop.py b/vllm/models/inkling2/amd/ops/loop.py
 new file mode 100644
-index 0000000000..2bad5e2489
+index 0000000000..9a59a3d1e3
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/ops/loop.py
-@@ -0,0 +1,141 @@
+@@ -0,0 +1,224 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Loop message controllers, batched over streams.
@@ -8651,6 +10018,89 @@ index 0000000000..2bad5e2489
 +            # The blend is unfused (no FMA), as the reference.
 +            enable_fp_fusion=False,
 +        )
++    return out
++
++
++@triton.jit
++def _pair_norm_gemv_kernel(
++    Dest,
++    Message,
++    W,
++    Y,
++    stride_dest_s,
++    stride_ws,
++    stride_wn,
++    N,
++    eps,
++    D: tl.constexpr,
++    BLOCK: tl.constexpr,
++    BN: tl.constexpr,
++    BK: tl.constexpr,
++):
++    # `_pair_rms_norm_kernel` of one stream's row (each program recomputes
++    # the two RMS), feeding `ops.linear._gemv_kernel`'s tile of BN rows.
++    s = tl.program_id(1).to(tl.int64)
++    dest_row = Dest + s * stride_dest_s
++    message_row = Message + s * D
++    cols = tl.arange(0, BLOCK)
++    mask = cols < D
++    dest = tl.load(dest_row + cols, mask, other=0)
++    message = tl.load(message_row + cols, mask, other=0)
++    dest_rstd = tl.rsqrt(tl.div_rn(tl.sum(dest * dest), D) + eps)
++    message_rstd = tl.rsqrt(tl.div_rn(tl.sum(message * message), D) + eps)
++
++    K: tl.constexpr = 2 * D
++    rows = tl.program_id(0) * BN + tl.arange(0, BN)
++    w_rows = W + s * stride_ws + rows[:, None].to(tl.int64) * stride_wn
++    acc = tl.zeros((BN, BK), tl.float32)
++    for k0 in tl.static_range(0, K, BK):
++        ks = k0 + tl.arange(0, BK)
++        is_dest = ks < D
++        xd = tl.load(dest_row + ks, is_dest, other=0) * dest_rstd
++        xm = tl.load(message_row + ks - D, (ks >= D) & (ks < K), other=0)
++        x = tl.where(is_dest, xd, xm * message_rstd).to(tl.bfloat16)
++        w = tl.load(
++            w_rows + ks[None, :], (rows[:, None] < N) & (ks[None, :] < K), other=0
++        )
++        acc += w.to(tl.float32) * x.to(tl.float32)[None, :]
++    y = tl.sum(acc, 1).to(Y.dtype.element_ty)
++    tl.store(Y + s * N + rows, y, rows < N)
++
++
++def pair_norm_gemv(
++    dest: torch.Tensor, message: torch.Tensor, weight: torch.Tensor
++) -> torch.Tensor:
++    """`gemv(pair_rms_norm(dest, message), weight)` for one token: fp32
++    `(S, 1, D)` `dest` (may broadcast over streams) and `message`, bf16
++    `(S, N, 2D)` `weight`; returns bf16 `(S, 1, N)`, the same bits as the
++    two launches."""
++    from .linear import _gemv_config
++
++    num_streams, num_tokens, d = message.shape
++    assert num_tokens == 1 and dest.shape == message.shape
++    assert message.is_contiguous() and dest.stride(2) == 1
++    assert dest.dtype == message.dtype == torch.float32
++    n = weight.shape[1]
++    assert weight.shape == (num_streams, n, 2 * d) and weight.stride(2) == 1
++    assert weight.dtype == torch.bfloat16
++    bn, bk, num_warps = _gemv_config(num_streams, n, 2 * d)
++    out = message.new_empty((num_streams, 1, n), dtype=torch.bfloat16)
++    _pair_norm_gemv_kernel[(triton.cdiv(n, bn), num_streams)](
++        dest,
++        message,
++        weight,
++        out,
++        dest.stride(0),
++        weight.stride(0),
++        weight.stride(1),
++        n,
++        1e-6,
++        D=d,
++        BLOCK=triton.next_power_of_2(d),
++        BN=bn,
++        BK=bk,
++        num_warps=num_warps,
++    )
 +    return out
 diff --git a/vllm/models/inkling2/amd/ops/moe.py b/vllm/models/inkling2/amd/ops/moe.py
 new file mode 100644
@@ -9778,10 +11228,10 @@ index 0000000000..919b2f4a68
 +            )
 diff --git a/vllm/models/inkling2/amd/ops/nvfp4_moe.py b/vllm/models/inkling2/amd/ops/nvfp4_moe.py
 new file mode 100644
-index 0000000000..c33894ac12
+index 0000000000..5f12b2ffec
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/ops/nvfp4_moe.py
-@@ -0,0 +1,290 @@
+@@ -0,0 +1,525 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Triton NVFP4 batched expert GEMMs for the Inkling2 MoE on gfx12.
@@ -9808,6 +11258,10 @@ index 0000000000..c33894ac12
 +equals the fp32 reference up to the order of the fp32 additions. No host
 +syncs: the grid is the plan's upper bound and programs past the routed tiles
 +return, so the GEMM can be captured in a HIP graph.
++
++Decode plans (a row or two per expert) run `gemv` instead: no WMMA, fp16
++pair dots (v_dot2_f32_f16) of the same exact decodes, the block scales on
++the fp32 sums of 8 products, closer to the memory bandwidth.
 +"""
 +
 +import functools
@@ -9979,6 +11433,232 @@ index 0000000000..c33894ac12
 +    tl.store(out_ptrs, out.to(tl.bfloat16), in_tile[:, None])
 +
 +
++# Decode (a row or two per expert): a GEMV-style kernel without WMMA, so no
++# layout conversions through LDS between the loads and the math, and the
++# whole K unrolled so that a thread has many loads in flight. A thread takes
++# whole 32-wide K groups (one activation scale block): 4 codes words (16
++# bytes) with their block scale bytes. A codes word (8 codes k0..k7, low
++# nibble = even k) decodes to the fp16 pairs (k0, k2), (k1, k3), (k4, k6),
++# (k5, k7), 2^-14 times the e2m1 values (as in `_NVFP4_TO_F16`, fp16
++# subnormals below 1); the word's 8 activation bytes decode to the same
++# pairs (`_E4M3_TO_F16`) and v_dot2_f32_f16 sums the 8 exact products in
++# fp32. The word's e4m3 block scale (shared by the 16-wide block) then
++# scales that fp32 sum, the activation scale the group's sum.
++#
++# $5 = codes word; $0..$3 the pairs, $4 scratch.
++_NVFP4_WORD_TO_F16 = tl.constexpr(
++    """
++    v_lshlrev_b32 $4, 4, $5
++    v_lshlrev_b32 $0, 1, $5
++    v_and_b32 $0, 0x0e0e0e0e, $0
++    v_and_or_b32 $0, $4, 0x80808080, $0
++    v_lshrrev_b32 $4, 3, $5
++    v_and_b32 $4, 0x0e0e0e0e, $4
++    v_and_or_b32 $4, $5, 0x80808080, $4
++    v_perm_b32 $1, $4, $0, 0x050c040c
++    v_perm_b32 $2, $4, $0, 0x030c020c
++    v_perm_b32 $3, $4, $0, 0x070c060c
++    v_perm_b32 $0, $4, $0, 0x010c000c
++    """
++)
++# Sum of the 4 pair products: weights $1..$4, activations $5..$8.
++_DOT8 = tl.constexpr(
++    """
++    v_dot2_f32_f16 $0, $1, $5, 0
++    v_dot2_f32_f16 $0, $2, $6, $0
++    v_dot2_f32_f16 $0, $3, $7, $0
++    v_dot2_f32_f16 $0, $4, $8, $0
++    """
++)
++
++
++@triton.jit
++def _nvfp4_gemv_groups(
++    w_row,
++    s_row,
++    a_row,
++    AScale,
++    row,
++    k,
++    KG: tl.constexpr,
++    TILE: tl.constexpr,
++    G: tl.constexpr,
++):
++    """fp32 [BN]: 2^-22 times the dot products over the 32-wide K groups
++    k .. k + G - 1 (those below KG) of BN weight rows (`w_row` int32 and
++    `s_row` uint8 [BN, 1, 1] pointers) with activation row `row` (`a_row`,
++    int64)."""
++    g = tl.arange(0, G)
++    g_in = (k + g) < KG
++    words = (k + g)[None, :, None] * 4 + tl.arange(0, 4)[None, None, :]
++    c = tl.load(w_row + words, g_in[None, :, None], other=0)
++    # One block scale byte per codes word: a load of the weights' shape and
++    # order, which Triton gives the weights' layout (no conversion).
++    s = tl.load(s_row + words // 2, g_in[None, :, None], other=0)
++    w0, w1, w2, w3, _ = tl.inline_asm_elementwise(
++        _NVFP4_WORD_TO_F16,
++        "=&v,=&v,=&v,=&v,=&v,v",
++        [c],
++        dtype=(tl.int32,) * 5,
++        is_pure=True,
++        pack=1,
++    )
++    # Unmasked rows: past the routed ones they are the (allocated) tile
++    # padding and only reach their own, unstored, output rows.
++    a = tl.load(a_row + words, g_in[None, :, None], other=0)
++    a0, a1 = tl.inline_asm_elementwise(
++        _E4M3_TO_F16,
++        "=&v,=&v,v",
++        [a.to(tl.int32)],
++        dtype=(tl.int32, tl.int32),
++        is_pure=True,
++        pack=1,
++    )
++    a2, a3 = tl.inline_asm_elementwise(
++        _E4M3_TO_F16,
++        "=&v,=&v,v",
++        [(a >> 32).to(tl.int32)],
++        dtype=(tl.int32, tl.int32),
++        is_pure=True,
++        pack=1,
++    )
++    part = tl.inline_asm_elementwise(
++        _DOT8,
++        "=&v,v,v,v,v,v,v,v,v",
++        [w0, w1, w2, w3, a0, a1, a2, a3],
++        dtype=tl.float32,
++        is_pure=True,
++        pack=1,
++    )
++    part = part * _e4m3_to_f32(s)
++    a_scale = tl.load(AScale + _scale_offsets(row, k + g, KG, TILE), g_in, other=0)
++    # Masked groups: zero codes and activations give 0 * 2^-127.
++    return tl.sum(tl.sum(part, 2) * _e8m0_to_f32(a_scale)[None, :], 1)
++
++
++@triton.jit
++def _nvfp4_gemv_kernel(
++    A,
++    AScale,
++    W,
++    WScale,
++    Amax,
++    Denominator,
++    Out,
++    Tiles,
++    max_ctas,
++    N: tl.constexpr,
++    K: tl.constexpr,
++    TILE: tl.constexpr,
++    BN: tl.constexpr,
++    G0: tl.constexpr,
++    G: tl.constexpr,
++):
++    # Program (n, t): BN output columns of token tile t, its routed rows one
++    # at a time (weights re-read from cache past the first), the whole K
++    # unrolled: G0 groups first (one wide load), the rest in steps of G.
++    # `A` as int64 (the 8 activation bytes of a codes word), `W` as int32
++    # (8 codes), `WScale` as uint8.
++    tile = tl.program_id(1)
++    if tile >= tl.load(Tiles + 2 * max_ctas):
++        return
++    row_end = tl.load(Tiles + max_ctas + tile)
++    expert = tl.load(Tiles + tile).to(tl.int64)
++    KG: tl.constexpr = K // 32
++    cols = tl.program_id(0) * BN + tl.arange(0, BN)
++    w_row = W + ((expert * N + cols) * (K // 8))[:, None, None]
++    s_row = WScale + ((expert * N + cols) * (K // 16))[:, None, None]
++    outer = tl.div_rn(tl.load(Amax + expert), tl.load(Denominator))
++    for row in range(tile * TILE, row_end):
++        a_row = A + row.to(tl.int64) * (K // 8)
++        acc = _nvfp4_gemv_groups(w_row, s_row, a_row, AScale, row, 0, KG, TILE, G0)
++        for k in tl.static_range(G0, KG, G):
++            acc += _nvfp4_gemv_groups(w_row, s_row, a_row, AScale, row, k, KG, TILE, G)
++        # 2^22 undoes the decodes' 2^-8 (activations) and 2^-14 (weights).
++        out = (acc * 4194304.0) * outer
++        tl.store(Out + row.to(tl.int64) * N + cols, out.to(tl.bfloat16))
++
++
++@dataclass(frozen=True)
++class Nvfp4GemvConfig:
++    """Decode launch config: BN columns per program; the K groups (32 wide)
++    unrolled as g0 first (one wide load; -1: the largest power of two of
++    them), then steps of g."""
++
++    bn: int
++    g0: int
++    g: int
++    num_warps: int
++
++
++# gfx12 decode configs by K, from a sweep on the R9700 (gfx1201) of Mini's
++# experts at 1 and 8 tokens (`.claude/r9700/scripts/b3_gemv_try.py`).
++_GFX12_GEMV_CONFIGS = {2304: (8, -1, 8, 2), 1152: (8, -1, 4, 1)}
++# The GEMV runs plans of at most this many tiles of 16 rows: up to 2 tokens
++# (top-8). Its cost grows with routed rows (each row of a tile re-decodes the
++# weights) while WMMA's grows with tiles, and real multi-token routing is
++# concentrated (DSpark verify of 8 tokens: 64 rows on ~29 experts, up to 8
++# rows a tile), so WMMA wins from 4 tokens on.
++GEMV_MAX_CTAS = 16
++
++
++@functools.cache
++def gemv_config(n: int, k: int) -> Nvfp4GemvConfig:
++    bn, g0, g, num_warps = _GFX12_GEMV_CONFIGS.get(k, (8, -1, 8, 2))
++    while n % bn:
++        bn //= 2
++    return Nvfp4GemvConfig(bn, g0, g, num_warps)
++
++
++def gemv(
++    act: torch.Tensor,
++    act_scale: torch.Tensor,
++    weight: torch.Tensor,
++    weight_scale: torch.Tensor,
++    amax: torch.Tensor,
++    denominator: torch.Tensor,
++    tiles: torch.Tensor,
++    plan: ExpertPlan,
++    config: Nvfp4GemvConfig | None = None,
++) -> torch.Tensor:
++    """`bmm` for decode: the same contract and result up to the order of the
++    fp32 additions, faster for a few routed rows per expert."""
++    num_experts, n, k_half = weight.shape
++    k = 2 * k_half
++    assert act.shape == (plan.rows, k) and act.dtype == torch.float8_e4m3fn
++    assert weight.dtype == torch.uint8
++    assert weight_scale.shape == (num_experts, n, k // 16)
++    assert weight_scale.dtype == torch.float8_e4m3fn
++    assert weight.is_contiguous() and weight_scale.is_contiguous()
++    assert k % 32 == 0
++    if config is None:
++        config = gemv_config(n, k)
++    g0 = config.g0
++    if g0 < 0:
++        g0 = 1 << ((k // 32).bit_length() - 1)
++    assert n % config.bn == 0 and 0 < g0 <= k // 32, (config, n, k)
++    out = torch.empty((plan.rows, n), dtype=torch.bfloat16, device=act.device)
++    _nvfp4_gemv_kernel[(n // config.bn, plan.max_ctas)](
++        act.view(torch.int64),
++        act_scale,
++        weight.view(torch.int32),
++        weight_scale.view(torch.uint8),
++        amax,
++        denominator,
++        out,
++        tiles,
++        plan.max_ctas,
++        N=n,
++        K=k,
++        TILE=plan.tile,
++        BN=config.bn,
++        G0=g0,
++        G=config.g,
++        num_warps=config.num_warps,
++    )
++    return out
++
++
 +@dataclass(frozen=True)
 +class Nvfp4BmmConfig:
 +    """Launch config: a BM x BN output block per program (BM divides the
@@ -10030,8 +11710,9 @@ index 0000000000..c33894ac12
 +    """bf16 `[plan.rows, N]` expert GEMM of the tile-padded MXFP8 `act` rows
 +    (block scales swizzled for `plan.tile`) with NVFP4 expert weights, by
 +    each tile's expert (`tiles`: the `moe.route` metadata). Rows past each
-+    tile's routed rows are left uninitialized. `config` overrides
-+    `bmm_config` (tuning)."""
++    tile's routed rows are left uninitialized. Decode plans (16-row tiles,
++    at most `GEMV_MAX_CTAS`) run `gemv`; `config` overrides `bmm_config`
++    (tuning) and always runs the WMMA kernel."""
 +    num_experts, n, k_half = weight.shape
 +    k = 2 * k_half
 +    assert act.shape == (plan.rows, k) and act.dtype == torch.float8_e4m3fn
@@ -10040,8 +11721,12 @@ index 0000000000..c33894ac12
 +    assert weight_scale.dtype == torch.float8_e4m3fn
 +    assert amax.shape == (num_experts,) and denominator.shape == (1,)
 +    assert weight.is_contiguous() and weight_scale.is_contiguous()
-+    out = torch.empty((plan.rows, n), dtype=torch.bfloat16, device=act.device)
 +    tile = plan.tile
++    if config is None and tile == 16 and plan.max_ctas <= GEMV_MAX_CTAS:
++        return gemv(
++            act, act_scale, weight, weight_scale, amax, denominator, tiles, plan
++        )
++    out = torch.empty((plan.rows, n), dtype=torch.bfloat16, device=act.device)
 +    if config is None:
 +        config = bmm_config(tile, n, k)
 +    assert n % config.bn == 0 and k % config.bk == 0 and config.bk % 32 == 0
@@ -10185,10 +11870,10 @@ index 0000000000..d15fbd62d0
 +    return out
 diff --git a/vllm/models/inkling2/amd/ops/sconv.py b/vllm/models/inkling2/amd/ops/sconv.py
 new file mode 100644
-index 0000000000..47ee6084bc
+index 0000000000..18f1fb5bad
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/ops/sconv.py
-@@ -0,0 +1,892 @@
+@@ -0,0 +1,1237 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Inkling2 short convolution over a paged sliding-window conv-state cache.
@@ -10215,6 +11900,12 @@ index 0000000000..47ee6084bc
 +
 +import torch
 +
++from vllm.models.inkling2.amd.ops.attn_res import (
++    ROW_MAX_PROGRAMS,
++    _row_mix,
++    attn_res,
++    row_blocks,
++)
 +from vllm.models.inkling2.amd.ops.norm import qr_clip_rel_tokens
 +from vllm.triton_utils import tl, triton
 +
@@ -10651,6 +12342,345 @@ index 0000000000..47ee6084bc
 +    return out
 +
 +
++@triton.jit
++def _conv_mix_part(
++    x_ptr,
++    cache_ptr,
++    weight_ptr,
++    out_ptr,
++    res_ptr,
++    addend_ptr,
++    pos_ptr,
++    seq_idx_ptr,
++    slot_ptr,
++    block_table_ptr,
++    qstart_ptr,
++    T,
++    stride_x,
++    stride_c_blk,
++    stride_c_h,
++    stride_c_n,
++    stride_w0,
++    stride_w1,
++    stride_bt,
++    max_blocks,
++    N,
++    scale,
++    toff,
++    coff,
++    W: tl.constexpr,
++    OFF: tl.constexpr,
++    WS: tl.constexpr,
++    H: tl.constexpr,
++    HAS_RES: tl.constexpr,
++    HAS_ADDEND: tl.constexpr,
++):
++    # `_sconv_kernel`'s decode tile (CACHE_FIRST) on columns `coff`.
++    C = H * WS
++    t_mask = toff < T
++    c_mask = coff < C
++    y = _conv(
++        x_ptr,
++        stride_x,
++        cache_ptr,
++        tl.minimum(coff // WS, H - 1) * stride_c_h + OFF + coff % WS,
++        stride_c_blk,
++        stride_c_n,
++        N,
++        weight_ptr,
++        stride_w0,
++        stride_w1,
++        pos_ptr,
++        seq_idx_ptr,
++        slot_ptr,
++        block_table_ptr,
++        stride_bt,
++        max_blocks,
++        qstart_ptr,
++        scale,
++        toff,
++        coff,
++        t_mask,
++        c_mask,
++        W,
++        dyn_ptr=None,
++        CACHE_FIRST=True,
++    ).to(out_ptr.dtype.element_ty)
++    offs = toff[:, None] * C + coff[None, :]
++    mask = t_mask[:, None] & c_mask[None, :]
++    if HAS_ADDEND:
++        acc = tl.load(addend_ptr + offs, mask, other=0).to(tl.float32)
++        if HAS_RES:
++            acc = tl.load(res_ptr + offs, mask, other=0).to(tl.float32) + acc
++        y = (acc + y.to(tl.float32)).to(out_ptr.dtype.element_ty)
++    tl.store(out_ptr + offs, y, mask=mask)
++
++
++@triton.jit
++def _conv_mix_kernel(
++    x_ptr,
++    cache_ptr,
++    weight_ptr,
++    out_ptr,
++    res_ptr,
++    addend_ptr,
++    pos_ptr,
++    seq_idx_ptr,
++    slot_ptr,
++    block_table_ptr,
++    qstart_ptr,
++    Stack,
++    Last,
++    Queries,
++    NormW,
++    Mix,
++    Counter,
++    T,
++    stride_x,
++    stride_c_blk,
++    stride_c_h,
++    stride_c_n,
++    stride_w0,
++    stride_w1,
++    stride_bt,
++    max_blocks,
++    N,
++    scale,
++    stride_s,
++    eps,
++    norm_eps,
++    W: tl.constexpr,
++    OFF: tl.constexpr,
++    WS: tl.constexpr,
++    H: tl.constexpr,
++    HAS_RES: tl.constexpr,
++    HAS_ADDEND: tl.constexpr,
++    N_STACK: tl.constexpr,
++    HAS_LAST: tl.constexpr,
++    NORMALIZE: tl.constexpr,
++    APPLY_NORM: tl.constexpr,
++    NUM_Q: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    BLOCK_A: tl.constexpr,
++    BLOCK_B: tl.constexpr,
++    BLOCK_C: tl.constexpr,
++):
++    """One token's BLOCK_C columns of the short conv (written to `out_ptr`);
++    the token's last program then computes its AttnRes mixes with every
++    query, read back from `out_ptr` as the row kernel reads them, so both
++    match `short_conv` + `attn_res` bit for bit."""
++    t = tl.program_id(0)
++    toff = t + tl.arange(0, 1)
++    conv = (
++        x_ptr,
++        cache_ptr,
++        weight_ptr,
++        out_ptr,
++        res_ptr,
++        addend_ptr,
++        pos_ptr,
++        seq_idx_ptr,
++        slot_ptr,
++        block_table_ptr,
++        qstart_ptr,
++        T,
++        stride_x,
++        stride_c_blk,
++        stride_c_h,
++        stride_c_n,
++        stride_w0,
++        stride_w1,
++        stride_bt,
++        max_blocks,
++        N,
++        scale,
++        toff,
++    )
++    # (Constexprs passed one by one: a tuple of them loses constexpr-ness.)
++    coff = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
++    _conv_mix_part(*conv, coff, W, OFF, WS, H, HAS_RES, HAS_ADDEND)
++    # The last of the token's column programs to finish mixes the row: its
++    # threads' stores are complete before the (release) count, the others'
++    # are visible after the (acquire) count and read past the per-CU cache.
++    tl.debug_barrier()
++    done = tl.atomic_add(Counter + t, 1, sem="acq_rel")
++    if done != tl.num_programs(1) - 1:
++        return
++    # Reset for the next launch (graph replays included).
++    tl.store(Counter + t, 0)
++    if HAS_LAST:
++        last, addend = Last, out_ptr
++    else:
++        last, addend = out_ptr, out_ptr
++    for q in tl.static_range(NUM_Q):
++        _row_mix(
++            Stack,
++            last,
++            addend,
++            Queries,
++            NormW,
++            Mix,
++            stride_s,
++            T,
++            eps,
++            norm_eps,
++            t.to(tl.int64),
++            q,
++            H * WS,
++            N_STACK,
++            HAS_LAST,
++            NORMALIZE,
++            APPLY_NORM,
++            BLOCK_N,
++            BLOCK_A,
++            BLOCK_B,
++            LAST_CG=True,
++        )
++
++
++_COUNTERS: dict[torch.device, torch.Tensor] = {}
++
++
++def _token_counters(device: torch.device) -> torch.Tensor:
++    """Per-token arrival counts of `_conv_mix_kernel`'s column programs;
++    zero between launches (each token's last program resets its count)."""
++    counters = _COUNTERS.get(device)
++    if counters is None:
++        counters = torch.zeros(ROW_MAX_PROGRAMS, dtype=torch.int32, device=device)
++        _COUNTERS[device] = counters
++    return counters
++
++
++def conv_mix(
++    x: torch.Tensor,
++    conv_weight: torch.Tensor,
++    cache: torch.Tensor,
++    positions: torch.Tensor,
++    block_table: torch.Tensor,
++    seq_idx: torch.Tensor,
++    slot_mapping: torch.Tensor,
++    query_start: torch.Tensor,
++    stream_offset: int,
++    stream_width: int,
++    conv_out: torch.Tensor,
++    residual: torch.Tensor | None,
++    addend: torch.Tensor | None,
++    stack: torch.Tensor,
++    last: torch.Tensor | None,
++    queries: torch.Tensor,
++    norm_weight: torch.Tensor | None,
++    norm_eps: float,
++    eps: float = 1e-6,
++) -> torch.Tensor:
++    """`short_conv` of `x` into `conv_out` (with the optional `(residual +
++    addend) + y` update), then `attn_res` over `[*stack, (last +) conv_out]`
++    with each query, normalized values: the `(Q, T, D)` mixes in bf16, or
++    fp32 without `norm_weight` (the NVIDIA `conv_mix` interface).
++
++
++    Small batches run as one launch (a program per token), equal bit for bit
++    to `short_conv` then `attn_res`; larger ones run those two.
++    """
++    num_tokens, d = conv_out.shape
++    num_q = queries.shape[0]
++    if num_tokens == 0 or num_tokens * num_q > ROW_MAX_PROGRAMS:
++        conv = short_conv(
++            x,
++            conv_weight,
++            cache,
++            positions,
++            block_table,
++            seq_idx,
++            slot_mapping,
++            query_start,
++            stream_offset,
++            stream_width,
++            addend,
++            residual,
++            conv_out,
++        )
++        return attn_res(
++            stack,
++            conv if last is None else last,
++            None if last is None else conv,
++            queries,
++            norm_weight,
++            norm_eps,
++            True,
++            eps,
++        )
++    assert x.stride(1) == 1 and cache.stride(3) == 1 and conv_out.is_contiguous()
++    assert x.shape == conv_out.shape
++    assert residual is None or addend is not None
++    for t in (addend, residual, last):
++        assert t is None or (t.is_contiguous() and t.shape == conv_out.shape)
++    assert stack.stride(1) == d and stack.stride(2) == 1
++    assert queries.dtype == torch.float32 and queries.is_contiguous()
++    num_heads = cache.shape[1]
++    assert d == num_heads * stream_width
++    width = conv_weight.shape[1]
++    apply_norm = norm_weight is not None
++    if norm_weight is None:
++        norm_weight = queries  # unread
++    assert norm_weight.shape == queries.shape and norm_weight.is_contiguous()
++    out_dtype = conv_out.dtype if apply_norm else torch.float32
++    mixes = torch.empty((num_q, num_tokens, d), dtype=out_dtype, device=x.device)
++    block_a, block_b = row_blocks(d)
++    num_stack = stack.shape[0]
++    block_c = 256
++    _conv_mix_kernel[(num_tokens, triton.cdiv(d, block_c))](
++        x,
++        cache,
++        conv_weight,
++        conv_out,
++        residual,
++        addend,
++        positions,
++        seq_idx,
++        slot_mapping,
++        block_table,
++        query_start,
++        stack,
++        last,
++        queries,
++        norm_weight,
++        mixes,
++        _token_counters(x.device),
++        num_tokens,
++        x.stride(0),
++        cache.stride(0),
++        cache.stride(1),
++        cache.stride(2),
++        conv_weight.stride(0),
++        conv_weight.stride(1),
++        block_table.stride(0),
++        block_table.shape[1],
++        cache.shape[2],
++        (width + 1) ** -0.5,
++        stack.stride(0),
++        eps,
++        norm_eps,
++        W=width,
++        OFF=stream_offset,
++        WS=stream_width,
++        H=num_heads,
++        HAS_RES=residual is not None,
++        HAS_ADDEND=addend is not None,
++        N_STACK=num_stack,
++        HAS_LAST=last is not None,
++        NORMALIZE=True,
++        APPLY_NORM=apply_norm,
++        NUM_Q=num_q,
++        BLOCK_N=triton.next_power_of_2(num_stack + 1),
++        BLOCK_A=block_a,
++        BLOCK_B=block_b,
++        BLOCK_C=block_c,
++        num_warps=8,
++        enable_fp_fusion=False,
++    )
++    return mixes
++
++
 +# Columns of shift_rel_proj beyond the extent, 256 on either side.
 +_SHIFT_PAD = 512
 +
@@ -11081,6 +13111,131 @@ index 0000000000..47ee6084bc
 +        num_warps=4,
 +        enable_fp_fusion=False,
 +    )
+diff --git a/vllm/models/inkling2/amd/ops/segment_gemv.py b/vllm/models/inkling2/amd/ops/segment_gemv.py
+new file mode 100644
+index 0000000000..69407a3a14
+--- /dev/null
++++ b/vllm/models/inkling2/amd/ops/segment_gemv.py
+@@ -0,0 +1,119 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Several one-row GEMVs with their own inputs and weights in one launch.
++
++Batch-1 decode projects a full (or looped) layer's query side, K and V and
++the K/V convs' dynamic taps from up to three inputs: five small GEMVs whose
++launch gaps cost about as much as their weight reads. `segment_gemv` runs
++them as one grid, each program one `ops.linear.gemv` tile of one segment
++with that GEMV's own tile shape, so every output equals its `gemv` bit for
++bit.
++"""
++
++import torch
++
++from vllm.triton_utils import tl, triton
++
++from .linear import _gemv_config
++
++MAX_SEGMENTS = 5
++
++
++@triton.jit
++def _gemv_tile(
++    X, W, Y, N, stride_wn, pid, K: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr
++):
++    # `ops.linear._gemv_kernel` for one stream.
++    rows = pid * BN + tl.arange(0, BN)
++    w_rows = W + rows[:, None].to(tl.int64) * stride_wn
++    acc = tl.zeros((BN, BK), tl.float32)
++    for k0 in tl.static_range(0, K, BK):
++        ks = k0 + tl.arange(0, BK)
++        x = tl.load(X + ks, ks < K, other=0)
++        w = tl.load(
++            w_rows + ks[None, :], (rows[:, None] < N) & (ks[None, :] < K), other=0
++        )
++        acc += w.to(tl.float32) * x.to(tl.float32)[None, :]
++    tl.store(Y + rows, tl.sum(acc, 1).to(Y.dtype.element_ty), rows < N)
++
++
++@triton.jit
++def _segment_gemv_kernel(
++    X0, W0, Y0, N0, S0,
++    X1, W1, Y1, N1, S1,
++    X2, W2, Y2, N2, S2,
++    X3, W3, Y3, N3, S3,
++    X4, W4, Y4, N4, S4,
++    K: tl.constexpr,
++    BK: tl.constexpr,
++    NUM_SEG: tl.constexpr,
++    BN0: tl.constexpr, BN1: tl.constexpr, BN2: tl.constexpr,
++    BN3: tl.constexpr, BN4: tl.constexpr,
++    END0: tl.constexpr, END1: tl.constexpr, END2: tl.constexpr,
++    END3: tl.constexpr,
++):  # fmt: skip
++    # Programs [END_{i-1}, END_i) are segment i's tiles.
++    pid = tl.program_id(0)
++    if pid < END0:
++        _gemv_tile(X0, W0, Y0, N0, S0, pid, K, BN0, BK)
++    elif NUM_SEG > 1 and pid < END1:
++        _gemv_tile(X1, W1, Y1, N1, S1, pid - END0, K, BN1, BK)
++    elif NUM_SEG > 2 and pid < END2:
++        _gemv_tile(X2, W2, Y2, N2, S2, pid - END1, K, BN2, BK)
++    elif NUM_SEG > 3 and pid < END3:
++        _gemv_tile(X3, W3, Y3, N3, S3, pid - END2, K, BN3, BK)
++    elif NUM_SEG > 4:
++        _gemv_tile(X4, W4, Y4, N4, S4, pid - END3, K, BN4, BK)
++
++
++def segment_gemv(
++    pairs: list[tuple[torch.Tensor, torch.Tensor]],
++) -> list[torch.Tensor] | None:
++    """`[gemv(x, w) for x, w in pairs]` in one launch: bf16 `(1, K)` inputs
++    and `(N, K)` weights (rows contiguous along K) with the same K.
++
++    Returns None (the caller runs the GEMVs one by one) when the GEMVs'
++    configs need different `BK` or warp counts.
++    """
++    assert 0 < len(pairs) <= MAX_SEGMENTS
++    k = pairs[0][1].shape[1]
++    configs = []
++    for x, w in pairs:
++        assert x.shape == (1, k) and w.shape[1] == k
++        assert x.dtype == w.dtype == torch.bfloat16
++        assert x.stride(-1) == 1 and w.stride(-1) == 1
++        configs.append(_gemv_config(1, w.shape[0], k))
++    if len({(bk, warps) for _, bk, warps in configs}) != 1:
++        return None
++    bk, num_warps = configs[0][1:]
++    outs = [x.new_empty((1, w.shape[0])) for x, w in pairs]
++    args: list = []
++    bns, ends = [], []
++    end = 0
++    for (x, w), y, (bn, _, _) in zip(pairs, outs, configs):
++        args += [x, w, y, w.shape[0], w.stride(0)]
++        bns.append(bn)
++        end += triton.cdiv(w.shape[0], bn)
++        ends.append(end)
++    for _ in range(MAX_SEGMENTS - len(pairs)):
++        # Unused segments: never read.
++        args += [*args[:2], args[2], 0, 0]
++        bns.append(1)
++        ends.append(end)
++    _segment_gemv_kernel[(end,)](
++        *args,
++        K=k,
++        BK=bk,
++        NUM_SEG=len(pairs),
++        BN0=bns[0],
++        BN1=bns[1],
++        BN2=bns[2],
++        BN3=bns[3],
++        BN4=bns[4],
++        END0=ends[0],
++        END1=ends[1],
++        END2=ends[2],
++        END3=ends[3],
++        num_warps=num_warps,
++    )
++    return outs
 diff --git a/vllm/models/inkling2/amd/ops/triton_bmm.py b/vllm/models/inkling2/amd/ops/triton_bmm.py
 new file mode 100644
 index 0000000000..8bf4f65565
@@ -11820,10 +13975,10 @@ index 0000000000..d047716623
 +        return self.expert_formats.get(layer_id) == "nvfp4"
 diff --git a/vllm/models/inkling2/amd/sconv.py b/vllm/models/inkling2/amd/sconv.py
 new file mode 100644
-index 0000000000..5b444f7566
+index 0000000000..83b47d949d
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/sconv.py
-@@ -0,0 +1,188 @@
+@@ -0,0 +1,243 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Inkling2 short convolutions with their state kept in a sliding-window cache.
@@ -11834,11 +13989,12 @@ index 0000000000..5b444f7566
 +full-width on every rank.
 +"""
 +
-+from typing import cast
++from typing import ClassVar, cast
 +
 +import torch
 +from torch import nn
 +
++from vllm.config import VllmConfig
 +from vllm.distributed import (
 +    get_tensor_model_parallel_rank,
 +    get_tensor_model_parallel_world_size,
@@ -11849,10 +14005,12 @@ index 0000000000..5b444f7566
 +    InklingConvState,
 +    InklingSconvMetadata,
 +)
++from vllm.v1.core.single_type_kv_cache_manager import TailSlidingWindowManager
++from vllm.v1.kv_cache_interface import KVCacheLayerConfig
 +
 +from .ops.attn_res import attn_res
 +from .ops.linear import decode_linear, linear_k_groups
-+from .ops.sconv import short_conv
++from .ops.sconv import conv_mix, short_conv
 +
 +K_STREAM, V_STREAM, ATTN_STREAM, MLP_STREAM = range(4)
 +
@@ -11866,6 +14024,28 @@ index 0000000000..5b444f7566
 +        # The v1 state divides the hidden width over the KV heads of all ranks.
 +        tp_size = get_tensor_model_parallel_world_size()
 +        super().__init__(hidden_size=hidden_size * tp_size, **kwargs)
++
++    # The conv kernels (`ops/sconv.py`) write every token's input to its slot
++    # but read from the cache only the `W - 1` taps before a step's first
++    # token, so the cache backs only each step's tail: the interior of a
++    # prefill chunk writes to the null block. False keeps a whole window per
++    # in-flight chunk (the plain sliding-window manager).
++    tail_only: ClassVar[bool] = True
++
++    def get_kv_cache_config(self, vllm_config: VllmConfig) -> KVCacheLayerConfig:
++        config = super().get_kv_cache_config(vllm_config)
++        if not self.tail_only:
++            return config
++        # A step reads the window before its first token, which rejected
++        # drafts of the in-flight steps can move back by up to
++        # num_speculative_tokens each.
++        return TailSlidingWindowManager.layer_config(
++            config.spec,
++            sliding_window=self.sliding_window,
++            num_speculative_tokens=vllm_config.num_speculative_tokens,
++            max_in_flight_steps=vllm_config.max_concurrent_batches,
++            num_lookahead_tokens=vllm_config.num_lookahead_tokens,
++        )
 +
 +
 +def conv_metadata(owner: InklingConvState) -> InklingSconvMetadata | None:
@@ -11931,16 +14111,20 @@ index 0000000000..5b444f7566
 +        """Static `(dim, W)` taps, or `(W, dim)` static part of dynamic taps."""
 +        return self.static_w if self.dynamic else self.weight.squeeze(1)
 +
++    @property
++    def dynamic_taps_gemv(self) -> bool:
++        """Whether `dynamic_taps` is a plain `decode_linear`."""
++        # Same dispatch as the reference ``linear``: fp32 1024-wide K groups.
++        return not (
++            self.weight_proj.shape[1] >= 2560
++            and self.weight_proj.shape[0] not in (1, 2, 4)
++        )
++
 +    def dynamic_taps(self, x: torch.Tensor) -> torch.Tensor | None:
 +        """Per-token tap deltas `(T, num_heads * W)` projected from `x`."""
 +        if not self.dynamic:
 +            return None
-+        # Same dispatch as the reference ``linear``: fp32 1024-wide K groups.
-+        if self.weight_proj.shape[1] >= 2560 and self.weight_proj.shape[0] not in (
-+            1,
-+            2,
-+            4,
-+        ):
++        if not self.dynamic_taps_gemv:
 +            return linear_k_groups(x.contiguous(), self.weight_proj, x.dtype)
 +        return decode_linear(x, self.weight_proj)
 +
@@ -11997,9 +14181,35 @@ index 0000000000..5b444f7566
 +        owner: InklingConvState | None = None,
 +    ) -> torch.Tensor:
 +        """Convolve `x` into `out` like `forward` and return the AttnRes
-+        mixes of `[*stack, (last +) out]` with `queries` through `norm`
-+        (the fp32 mixes without it). The NVIDIA `conv_mix` interface, run
-+        unfused: `short_conv`, then `attn_res`."""
++        mixes of `[*stack, (last +) out]` with `queries` through `norm` (the
++        fp32 mixes without it): the NVIDIA `conv_mix` interface, one launch
++        for small batches."""
++        assert not self.dynamic
++        if owner is None:
++            owner = self.owner
++        m = conv_metadata(owner)
++        if m is not None:
++            offset, width = owner.stream_ranges[self.stream]
++            return conv_mix(
++                x,
++                self.conv_weight,
++                owner.kv_cache,
++                positions,
++                m.block_table,
++                m.seq_idx,
++                m.slot_mapping,
++                m.query_start,
++                offset,
++                width,
++                out,
++                residual,
++                addend,
++                stack,
++                last,
++                queries,
++                None if norm is None else norm.weight,
++                0.0 if norm is None else norm.eps,
++            )
 +        conv = self(
 +            x, positions, addend=addend, residual=residual, out=out, owner=owner
 +        )
@@ -15239,11 +17449,38 @@ index 22face5f3f..5a861b5642 100644
              return "inkling2"
          return None
  
+diff --git a/vllm/models/inkling2/speculator.py b/vllm/models/inkling2/speculator.py
+index 6beae2b0d5..181925aad1 100644
+--- a/vllm/models/inkling2/speculator.py
++++ b/vllm/models/inkling2/speculator.py
+@@ -18,7 +18,7 @@ class Inkling2DSparkSpeculator(DSparkSpeculator):
+         super().__init__(vllm_config, device)
+         config = self.draft_model_config.hf_config
+         assert not self.sample_from_anchor
+-        assert self._draft_topk is None and not self.enable_adaptive_verification
++        assert self._draft_topk is None
+         self.hidden_states = torch.zeros(
+             self.max_num_tokens,
+             len(config.target_layer_ids) * config.hidden_size,
+@@ -70,6 +70,13 @@ class Inkling2DSparkSpeculator(DSparkSpeculator):
+         for i in range(n_spec):
+             state, bias = self.model.markov_step(state, prev, context[i])
+             if self.draft_logits is None:
++                if self.acceptance_estimator is not None:
++                    # Adaptive verification: the draft's top-token confidence
++                    # from the full softcapped logits.
++                    logits = self.model.markov_logits(base_logits[:, i], bias)
++                    self._maybe_predict_acceptance(
++                        logits, idx_map[:, i], self._step_cols[i]
++                    )
+                 prev = self.model.markov_argmax(base_logits[:, i], bias)
+             else:
+                 logits = self.model.markov_logits(base_logits[:, i], bias)
 diff --git a/vllm/models/inkling2/speculator_config.py b/vllm/models/inkling2/speculator_config.py
-index 617bc5e0ff..2b071e663a 100644
+index 617bc5e0ff..1daee38d8a 100644
 --- a/vllm/models/inkling2/speculator_config.py
 +++ b/vllm/models/inkling2/speculator_config.py
-@@ -1,7 +1,27 @@
+@@ -1,7 +1,67 @@
  # SPDX-License-Identifier: Apache-2.0
  # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +from typing import TYPE_CHECKING
@@ -15257,6 +17494,38 @@ index 617bc5e0ff..2b071e663a 100644
  
  class Inkling2DSparkSpeculatorConfig(DSparkSpeculatorConfig):
      speculator_class = "vllm.models.inkling2.speculator.Inkling2DSparkSpeculator"
++    supported_options = DSparkSpeculatorConfig.supported_options | {
++        "speculator_options"
++    }
++
++    @classmethod
++    def apply_options(cls, spec: "SpeculativeConfig") -> None:
++        super().apply_options(spec)
++        options = dict(spec.speculator_options or {})
++        draft_context = options.pop("draft_context", None)
++        if options:
++            raise ValueError(
++                f"Unknown Inkling2 DSpark speculator_options: {sorted(options)}; "
++                "supported: ['draft_context']"
++            )
++        if draft_context is None:
++            return
++        if (
++            not isinstance(draft_context, int)
++            or isinstance(draft_context, bool)
++            or draft_context < 0
++        ):
++            raise ValueError(
++                f"draft_context must be a non-negative integer, got {draft_context!r}"
++            )
++        if draft_context and not current_platform.is_rocm():
++            raise ValueError(
++                "Inkling2 DSpark draft_context is implemented on ROCm only"
++            )
++        # The draft's global layer attends to the last `draft_context`
++        # positions before each block (0: the whole context). Verification
++        # stays exact, so this trades acceptance for draft KV memory only.
++        spec.draft_model_config.hf_config.draft_context = draft_context
 +
 +    @classmethod
 +    def adapt_draft_model_config(cls, spec: "SpeculativeConfig") -> None:
@@ -15266,11 +17535,19 @@ index 617bc5e0ff..2b071e663a 100644
 +            and current_platform.is_device_capability_family(120)
 +        ):
 +            # The target's clipped, unit-scale FP8 cache does not describe the
-+            # draft's unnormalized values. Keep the draft cache in BF16.
++            # draft's unnormalized values, so the draft cache defaults to BF16.
++            # On ROCm it may be unit-scale FP8 (E4M3) on request: the draft
++            # only proposes tokens, verification stays exact.
++            allowed = ("auto", "bfloat16")
++            if current_platform.is_rocm():
++                allowed += ("fp8", "fp8_e4m3")
 +            if spec.kv_cache_dtype is None:
 +                spec.kv_cache_dtype = "auto"
-+            elif spec.kv_cache_dtype not in ("auto", "bfloat16"):
-+                raise ValueError("Inkling2 DSpark requires BF16 draft KV")
++            elif spec.kv_cache_dtype not in allowed:
++                raise ValueError(
++                    f"Inkling2 DSpark draft KV must be one of {allowed}, got "
++                    f"{spec.kv_cache_dtype!r}"
++                )
 diff --git a/vllm/platforms/rocm.py b/vllm/platforms/rocm.py
 index d5d26dfcb5..912686041c 100644
 --- a/vllm/platforms/rocm.py
@@ -15348,3 +17625,111 @@ index 044e8b9bdd..675a430104 100644
  ]
  
  
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index 84dfa53f19..15a9818fa7 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -1549,6 +1549,75 @@ class DFlashSlidingWindowManager(SlidingWindowManager):
+         return mask
+ 
+ 
++class TailSlidingWindowManager(DFlashSlidingWindowManager):
++    """Sliding-window cache read only before each step's first token.
++
++    For per-position caches like a short convolution's input history: a step
++    writes every token's slot but reads from the cache only the window before
++    its first token (in-step taps come from the step's own inputs). Like
++    `DFlashSlidingWindowManager`, an allocation backs only the blocks from
++    `num_tokens_main_model - tail_tokens` on, so the slots of a long chunk's
++    interior map to the null block, which nothing reads; one request holds
++    about one tail per in-flight step rather than the whole chunk.
++
++    Unlike DFlash, a prefix hit at `h` reads the window before `h`, so hits
++    and the blocks kept for them follow plain sliding window: only backed
++    blocks (chunk ends and decoded tokens) are cached and can serve a hit.
++    """
++
++    @classmethod
++    def find_longest_cache_hit(
++        cls,
++        block_hashes: BlockHashList,
++        max_length: int,
++        kv_cache_group_ids: list[int],
++        block_pool: BlockPool,
++        block_size: int,
++        manager_config: ManagerConfig,
++        alignment_tokens: int,
++        dcp_world_size: int = 1,
++        pcp_world_size: int = 1,
++        num_request_tokens: int | None = None,
++    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
++        return super(DFlashSlidingWindowManager, cls).find_longest_cache_hit(
++            block_hashes,
++            max_length,
++            kv_cache_group_ids,
++            block_pool,
++            block_size,
++            manager_config,
++            alignment_tokens,
++            dcp_world_size,
++            pcp_world_size,
++            num_request_tokens,
++        )
++
++    @classmethod
++    def reachable_block_mask(
++        cls,
++        start_block: int,
++        end_block: int,
++        alignment_tokens: int | None,
++        block_size: int,
++        manager_config: ManagerConfig,
++        retention_interval: int | None = None,
++        reachable_boundaries: Sequence[int] = (),
++        dcp_world_size: int = 1,
++        final_segment_end_block: int | None = None,
++    ) -> list[bool] | None:
++        return super(DFlashSlidingWindowManager, cls).reachable_block_mask(
++            start_block,
++            end_block,
++            alignment_tokens,
++            block_size,
++            manager_config,
++            retention_interval,
++            reachable_boundaries,
++            dcp_world_size,
++            final_segment_end_block,
++        )
++
++
+ class CircularBufferManager(SingleTypeKVCacheManager):
+     """Claims the ring's single block per request; prefix caching disabled.
+ 
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 1f831da6ff..9e1d02ae88 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1255,7 +1255,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             for batch in self.adaptive_verification.batches_to_profile(
+                 self.cudagraph_manager.captured_token_counts()
+             ):
+-                self._dummy_run(**batch, skip_eplb=True)
++                # Routed random ids: padding tokens skip the experts and
++                # all-zero ids all pick the same ones, either of which prices
++                # MoE verification far below real text.
++                self._dummy_run(**batch, skip_eplb=True, randomize_inputs=True)
+         self.adaptive_verification.set_initial_cost_curves(timings)
+ 
+     def _remove_request(self, req_id: str) -> bool:
+@@ -1990,8 +1993,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 self.input_buffers,
+                 max_query_len=batch_desc.max_query_len,
+                 # Profiling and warmup must route the dummy tokens to experts
+-                # so MoE memory is measured and MoE kernels are exercised.
+-                is_padding=not is_profile,
++                # so MoE memory is measured and MoE kernels are exercised;
++                # random ids are meant to spread them over the experts too.
++                is_padding=not (is_profile or randomize_inputs),
+             )
+             if randomize_inputs:
+                 # All-zero input_ids route every token to the same experts.
