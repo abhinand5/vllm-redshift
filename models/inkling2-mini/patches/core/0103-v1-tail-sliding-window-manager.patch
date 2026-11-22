@@ -1,5 +1,5 @@
 redshift patch: core/0103-v1-tail-sliding-window-manager.patch
-cut from: b6faecc59a..47ef1ba127 -- vllm/v1/core/single_type_kv_cache_manager.py
+cut from: b6faecc59a..a15d7e0248 -- vllm/v1/core/single_type_kv_cache_manager.py
 commits:
   d896b395af Abhinand B: [K] Inkling2 ROCm: tail-only conv-state cache manager
 

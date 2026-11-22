@@ -1,5 +1,5 @@
 redshift patch: model/0202-inkling2-amd-tests.patch
-cut from: b6faecc59a..47ef1ba127 -- tests
+cut from: b6faecc59a..a15d7e0248 -- tests
 commits:
   85101d9f9d Abhinand B: [A] Inkling2 ROCm: enable gfx12x bring-up, keep SM12x checks CUDA-only
   cc582f55e6 Abhinand B: [F] Inkling2 ROCm: support Inkling-2-Mini widths in MoE combine and SwiGLU quantize
@@ -28,6 +28,8 @@ commits:
   3a5cd3deb8 Abhinand B: [F] Inkling2 ROCm: loop pass messages in one launch, pair RMSNorm in the controller GEMV
   f49c49681e Abhinand B: [F] Inkling2 ROCm: fused short conv + AttnRes mix for small batches
   0db1b8ab9a Abhinand B: [B] Inkling2 ROCm NVFP4: run the decode GEMV only up to 2 tokens
+  f622296445 Abhinand B: [A] Inkling2 AMD DSpark: e4m3 draft head and Markov fold
+  a15d7e0248 Abhinand B: [A] Inkling2 AMD: direct NVFP4 MoE decode with bf16 activations
 
 diff --git a/tests/models/inkling2/test_attention.py b/tests/models/inkling2/test_attention.py
 index 7b87b97c92..1b49dcd466 100644
@@ -131,7 +133,7 @@ index 7b87b97c92..1b49dcd466 100644
  @pytest.mark.parametrize("num_tokens", [1, 300])
  def test_gate_sink(num_tokens):
 diff --git a/tests/models/inkling2/test_core_ops.py b/tests/models/inkling2/test_core_ops.py
-index 91bdd7d34f..b4d40ec904 100644
+index 91bdd7d34f..afa50d3e3d 100644
 --- a/tests/models/inkling2/test_core_ops.py
 +++ b/tests/models/inkling2/test_core_ops.py
 @@ -3,6 +3,7 @@
@@ -319,7 +321,7 @@ index 91bdd7d34f..b4d40ec904 100644
  )
  @pytest.mark.parametrize("shape", [(131, 130), (6552, 2304)])
  @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-@@ -688,3 +782,215 @@ def test_sm12x_linear_large_batch_fallback():
+@@ -688,3 +782,261 @@ def test_sm12x_linear_large_batch_fallback():
      weight = torch.randn(129, 256, device=DEVICE).bfloat16()
      expected = torch.nn.functional.linear(x, weight)
      torch.testing.assert_close(linear(x, weight), expected, atol=0, rtol=0)
@@ -535,6 +537,52 @@ index 91bdd7d34f..b4d40ec904 100644
 +        ref = attn_res(bank[:1], bank[1], None, queries[layer], None, 0.0, True)
 +        rows = batched[layer * streams : (layer + 1) * streams]
 +        torch.testing.assert_close(rows, ref, atol=0, rtol=0)
++
++
++@pytest.mark.skipif(not _is_rocm, reason="ROCm e4m3 draft-head GEMV")
++@pytest.mark.parametrize("rows", [1, 2, 7, 14, 16])
++@pytest.mark.parametrize(
++    "n, k, bias",
++    [
++        (4096, 2304, False),  # draft LM head (a slice of the vocab)
++        (4096, 256, True),  # folded Markov projection + bias
++        (131, 130, True),  # tails in N and K
++    ],
++)
++def test_rocm_fp8_rows_linear_matches_dequantized_fp64(rows, n, k, bias):
++    """`fp8_rows_linear` over `quantize_fp8_rows` weights: the fp64 product of
++    the fp16-rounded rows and the dequantized e4m3 weight (plus bias) within
++    output rounding, every e4m3 code decoded (subnormals and zero included),
++    and stable under graph replay."""
++    from vllm.models.inkling2.amd.ops.linear import (
++        fp8_rows_linear,
++        quantize_fp8_rows,
++    )
++
++    torch.manual_seed(0)
++    weight = (torch.randn(n, k, device=DEVICE) * 0.02).bfloat16()
++    weight[0, :] = 0.0
++    weight[1, : min(k, 64)] = torch.logspace(-12, 0, min(k, 64), device=DEVICE)
++    q, scale = quantize_fp8_rows(weight)
++    b = torch.randn(n, device=DEVICE).bfloat16() if bias else None
++    x = torch.randn(rows, k + 8, device=DEVICE).bfloat16()[:, :k]
++
++    def check(out):
++        deq = q.double() * scale.double()[:, None]
++        ref = x.half().double() @ deq.T
++        if b is not None:
++            ref = ref + b.double()
++        rounding = (ref.bfloat16().double() - ref).abs()
++        assert out.dtype == torch.bfloat16 and out.shape == (rows, n)
++        assert ((out.double() - ref).abs() <= 1e-4 + rounding).all()
++
++    check(fp8_rows_linear(x, q, scale, b))
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        out = fp8_rows_linear(x, q, scale, b)
++    x.copy_(torch.randn_like(x))
++    graph.replay()
++    check(out)
 diff --git a/tests/models/inkling2/test_dspark.py b/tests/models/inkling2/test_dspark.py
 index bb3bd35a13..73841a296e 100644
 --- a/tests/models/inkling2/test_dspark.py
@@ -1435,10 +1483,10 @@ index a975b238eb..feafc55c50 100644
      the dequantized operands, scaled per row (NVFP4) and rounded to bf16."""
 diff --git a/tests/models/inkling2/test_quant_rocm.py b/tests/models/inkling2/test_quant_rocm.py
 new file mode 100644
-index 0000000000..021abca460
+index 0000000000..17be9aeee2
 --- /dev/null
 +++ b/tests/models/inkling2/test_quant_rocm.py
-@@ -0,0 +1,709 @@
+@@ -0,0 +1,815 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Inkling2 quantization on ROCm (`amd/`): hf_quant_config.json parameter
@@ -1952,6 +2000,107 @@ index 0000000000..021abca460
 +    _check_bmm(*case, f"gemv k={k} tiny={tiny}", kernel="gemv")
 +
 +
++def _gemv_f16_case(k: int, tiny: bool, n: int = 256):
++    torch.manual_seed(0)
++    counts = [1, 0, 2, 1, 3, 16, 1]
++    weight, weight_scale = _random_nvfp4(len(counts), n, k)
++    if tiny:
++        weight_scale = torch.randint(1, 8, weight_scale.shape, device="cuda")
++        weight_scale = weight_scale.to(torch.uint8).view(torch.float8_e4m3fn)
++    amax = torch.rand(len(counts), device="cuda") + 0.5
++    denominator = torch.tensor([2688.0], device="cuda")
++    plan = triton_bmm.expert_plan(sum(counts), 1, len(counts), 16)
++    tiles, rows = _tiles(counts, 16, plan)
++    w = _oracle_nvfp4(weight, weight_scale, amax, denominator)
++    weights = (weight, weight_scale, amax, denominator, tiles, plan)
++    return plan, weights, rows, w
++
++
++@pytest.mark.parametrize("k", [1152, 2304])
++@pytest.mark.parametrize("tiny", [False, True])
++@pytest.mark.parametrize("by_token", [False, True])
++def test_nvfp4_gemv_f16_matches_fp64(k: int, tiny: bool, by_token: bool):
++    """Decode GEMV with bf16 activations (fp16 pair layout) at Mini's K vs.
++    an fp64 oracle; `by_token`: rows read through a row -> token map (w13);
++    `tiny`: e4m3 subnormal block scales and activations near fp16's normal
++    range, where flushed denormals would show."""
++    plan, weights, rows, w = _gemv_f16_case(k, tiny)
++    std = 2.0**-10 if tiny else 1.0
++    if by_token:
++        x = (torch.randn(3, k, device="cuda") * std).bfloat16()
++        token = torch.randint(0, 3, (plan.rows,), device="cuda", dtype=torch.int32)
++        act, row_token = nvfp4_moe.to_f16_pairs(x), token
++        a64 = x.double()[token.long()]
++    else:
++        x = (torch.randn(plan.rows, k, device="cuda") * std).bfloat16()
++        act, row_token, a64 = nvfp4_moe.to_f16_pairs(x), None, x.double()
++    out = nvfp4_moe.gemv_f16(act, row_token, *weights)
++    index = torch.tensor([r for r, _ in rows], device="cuda")
++    exact = torch.stack([a64[r] @ w[e].T for r, e in rows])
++    top = exact.abs().max().item()
++    got = out[index].double()
++    torch.testing.assert_close(
++        got, exact.bfloat16().double(), atol=1e-2 * top, rtol=1e-2
++    )
++    assert (got - exact).abs().max().item() / top < 1e-2
++
++
++def test_nvfp4_gemv_f16_situ_epilogue():
++    """`situ`: the w13 GEMV's SiTU output equals `activation._situ` on its
++    bf16 output (same fp32 ops, one bf16 rounding), in the pair layout."""
++    k, n = 2304, 512
++    plan, weights, rows, _ = _gemv_f16_case(k, False, n)
++    x = torch.randn(plan.rows, k, device="cuda").bfloat16()
++    act = nvfp4_moe.to_f16_pairs(x)
++    gammas = torch.rand(plan.rows, device="cuda") * 8
++    gate_up = nvfp4_moe.gemv_f16(act, None, *weights)
++    fused = nvfp4_moe.gemv_f16(act, None, *weights, situ=(gammas, 4.0, 25.0))
++    index = torch.tensor([r for r, _ in rows], device="cuda")
++    # The MXFP8 SiTU quantizes `_situ`'s bf16 values; its own fp32 copy:
++    g, u = gate_up[index].float()[:, 0::2], gate_up[index].float()[:, 1::2]
++    ref = (
++        (4.0 * torch.tanh(g / 4.0) * torch.sigmoid(g))
++        * (25.0 * torch.tanh(u / 25.0))
++        * gammas[index, None]
++    )
++    slot = nvfp4_moe.to_f16_pairs(torch.arange(n // 2, device="cuda").float()[None])[
++        0
++    ].long()
++    got = torch.empty_like(fused[index])
++    got[:, slot] = fused[index]
++    torch.testing.assert_close(
++        got.float(), ref.bfloat16().float(), atol=1e-3, rtol=1e-2
++    )
++
++
++@pytest.mark.parametrize("tokens", [1, 2, 5])
++def test_nvfp4_moe_direct_decode_matches_bf16_reference(
++    dist_init, monkeypatch, tokens: int
++):
++    """GEMV plans run `gemv_f16` (bf16 activations, SiTU in the w13 GEMV)
++    and match the bf16-activation reference; off, the MXFP8 path runs."""
++    moe = _build_moe("nvfp4", _random_moe_weights("nvfp4"))
++    x = torch.randn(tokens, 512, device="cuda").bfloat16()
++    calls = []
++    real = nvfp4_moe.gemv_f16
++    monkeypatch.setattr(
++        nvfp4_moe, "gemv_f16", lambda *a, **kw: calls.append(1) or real(*a, **kw)
++    )
++    plan = moe.experts.plan(tokens)
++    direct = moe.experts.direct_decode(tokens, plan)
++    assert direct == (plan.tile == 16 and plan.max_ctas <= 16)
++    out = moe(x)
++    assert bool(calls) == direct
++    ref = _moe_reference(moe, x, MOE_CONFIG, "bf16" if direct else "mxfp8")
++    scale = ref.abs().max().item()
++    assert scale > 0.1
++    torch.testing.assert_close(out, ref, atol=4e-3 * scale, rtol=2e-2)
++    monkeypatch.setattr(moe_module, "DIRECT_DECODE", False)
++    calls.clear()
++    moe(x)
++    assert not calls
++
++
 +@requires_checkpoint
 +@pytest.mark.parametrize("layer", [0, 19])
 +@pytest.mark.parametrize("name", ["w13", "w2"])
@@ -2027,9 +2176,12 @@ index 0000000000..021abca460
 +    return weights
 +
 +
-+def _moe_reference(moe, x: torch.Tensor, cfg) -> torch.Tensor:
++def _moe_reference(
++    moe, x: torch.Tensor, cfg, act_format: str = "mxfp8"
++) -> torch.Tensor:
 +    """Per-token loop over the selected experts' fp64-dequantized weights,
-+    MXFP8 activations (as the ROCm layer quantizes them)."""
++    MXFP8 activations (as the ROCm layer quantizes them) or, with
++    `act_format = "bf16"`, unquantized bf16 activations (the NVFP4 decode GEMV)."""
 +    from vllm.models.inkling2.amd.ops.linear import linear_k_groups
 +
 +    logits = linear_k_groups(x, moe.gate.weight).float()
@@ -2040,7 +2192,6 @@ index 0000000000..021abca460
 +    exp = moe.experts
 +
 +    def linear(a, name, e):
-+        av, as_ = mxfp8_quantize(a)
 +        w = getattr(exp, f"{name}_weight")[e]
 +        s = getattr(exp, f"{name}_weight_scale")[e]
 +        if exp.nvfp4:
@@ -2049,6 +2200,9 @@ index 0000000000..021abca460
 +            wd = _oracle_nvfp4(w[None], s[None], amax, den)[0]
 +        else:
 +            wd = _dequant_mxfp8(w, s)
++        if act_format == "bf16":
++            return (a.double() @ wd.T).bfloat16()
++        av, as_ = mxfp8_quantize(a)
 +        return (_dequant_mxfp8(av, as_) @ wd.T).bfloat16()
 +
 +    out = torch.zeros(x.shape, dtype=torch.float64, device=x.device)

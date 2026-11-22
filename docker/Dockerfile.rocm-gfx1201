@@ -19,12 +19,15 @@ ENV ROCM_PATH=$SP/_rocm_sdk_devel ROCM_HOME=$SP/_rocm_sdk_devel HIP_PATH=$SP/_ro
     VLLM_TARGET_DEVICE=rocm PYTORCH_ROCM_ARCH=gfx1201 HIP_VISIBLE_DEVICES=0 ROCR_VISIBLE_DEVICES=0
 COPY . /src
 WORKDIR /src
-RUN uv pip install --system --no-cache $IDX -c requirements/constraints-rocm10.txt \
+# Index order for vLLM's own dependencies and build (after the cached torch layer). Defaults to IDX; a local build can
+# put PyPI first when AMD's mirror is slow: DEPS_IDX="--index-url https://pypi.org/simple --extra-index-url ..."
+ARG DEPS_IDX=$IDX
+RUN uv pip install --system --no-cache $DEPS_IDX -c requirements/constraints-rocm10.txt \
       "cmake>=3.26,<4" ninja "setuptools-rust>=1.9" "setuptools-scm>=8" "setuptools>=78.1.1,<80" wheel \
       -r requirements/requirements-rocm-r9700.txt
 RUN export PATH=$ROCM_PATH/bin:$PATH CMAKE_PREFIX_PATH=$ROCM_PATH MAX_JOBS=$MAX_JOBS NVCC_THREADS=1 \
       CMAKE_BUILD_PARALLEL_LEVEL=$MAX_JOBS SETUPTOOLS_SCM_PRETEND_VERSION=$VLLM_VERSION \
-    && uv pip install --system --no-cache --no-build-isolation $IDX -c requirements/constraints-rocm10.txt . \
+    && uv pip install --system --no-cache --no-build-isolation $DEPS_IDX -c requirements/constraints-rocm10.txt . \
     && rm -rf build /root/.cargo/registry
 WORKDIR /
 # The R9700 tuning (GPU_MAX_HW_QUEUES=2 etc.) is applied by vLLM itself (vllm/platforms/rocm.py).

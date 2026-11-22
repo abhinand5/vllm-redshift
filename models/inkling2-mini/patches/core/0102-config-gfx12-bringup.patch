@@ -1,5 +1,5 @@
 redshift patch: core/0102-config-gfx12-bringup.patch
-cut from: b6faecc59a..47ef1ba127 -- vllm/config/vllm.py
+cut from: b6faecc59a..a15d7e0248 -- vllm/config/vllm.py
 commits:
   85101d9f9d Abhinand B: [A] Inkling2 ROCm: enable gfx12x bring-up, keep SM12x checks CUDA-only
 

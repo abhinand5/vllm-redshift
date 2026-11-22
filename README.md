@@ -25,7 +25,7 @@ pinned upstream vLLM, and ships it as a Docker image with an OpenAI-compatible s
 | **Model** | [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini): 26B total / 3.5B active MoE, text + images |
 | **Weights** | as shipped: NVFP4 + MXFP8 experts, BF16 for the rest (20 GB, not requantized) |
 | **Context** | **196,608 tokens**, 2 requests at once (416,701-token FP8 KV pool) |
-| **Decode** | **~78 tok/s** plain, **78-113 tok/s** with DSpark speculative decoding (2.5-3.6x llama.cpp Q8); **80-119 tok/s** at the model's default sampling (T=1.0) |
+| **Decode** | **~79 tok/s** plain, **86-116 tok/s** with DSpark speculative decoding (2.8-3.7x llama.cpp Q8); **86-133 tok/s** at the model's default sampling (T=1.0) |
 | **Prefill** | **~4,600 tok/s** at 4K-16K tokens, 3,700 tok/s at 64K |
 | **Extras** | tool calling, reasoning, up to 64 images per prompt, 0% CPU when idle |
 
@@ -35,7 +35,7 @@ xychart-beta
     title "Decode speed, 1 request, 512 tokens, greedy (tok/s, higher is better)"
     x-axis ["llama.cpp Q8", "redshift", "+ DSpark, prose", "+ DSpark, code"]
     y-axis "tokens / s" 0 --> 120
-    bar [31.4, 77.6, 81.5, 112.7]
+    bar [31.4, 78.7, 87.1, 116.1]
 ```
 
 ```mermaid
@@ -44,13 +44,14 @@ xychart-beta
     title "Prefill speed by prompt length (tok/s, higher is better)"
     x-axis ["4K tokens", "16K tokens", "64K tokens"]
     y-axis "tokens / s" 0 --> 5000
-    bar [4608, 4531, 3742]
+    bar [4557, 4523, 3728]
 ```
 
 <sub>One R9700, FP8 KV, measured through the API with `scripts/release_check.py` (temperature 0) on 2026-11-22. At the
-model's default T=1.0 (1024 tokens, 11 seeds): prose 79.6, short code 102.0, 45K-token code prompt 118.6 tok/s. DSpark
+model's default T=1.0 (1024 tokens, 6 seeds): prose 86.3, short code 102.2, 41K-token code prompt 133.3 tok/s. DSpark
 gains depend on how predictable the text is: code runs fastest. llama.cpp: Unsloth UD-Q8_K_XL GGUF on ROCm 7.2.4, no drafter. Two
-concurrent 191K-token "needle in a haystack" prompts: both answered correctly (155 s).</sub>
+concurrent 191K-token "needle in a haystack" prompts: both answered correctly (v0.4.0: in one of three runs one answer
+ran past the test's 600-token limit while reasoning, after quoting the right code).</sub>
 
 ## Quick start
 

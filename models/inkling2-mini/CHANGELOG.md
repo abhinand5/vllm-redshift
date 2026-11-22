@@ -4,6 +4,22 @@ Versions follow semver for people serving the model: MAJOR = incompatible serve 
 weights; MINOR = new vLLM base or new optimizations; PATCH = fixes only. Release tag: `inkling2-mini/vX.Y.Z`
 (must equal `VERSION` in `model.env`). Numbers: 1x R9700, FP8 KV, `scripts/release-check.sh` unless noted.
 
+## v0.4.0 (2026-11-22)
+vLLM base `bf151b7eb1` (unchanged). Same weights (served as shipped), same serve flags.
+- Long-context decode/verify attention on gfx12: more splits per KV head and new block configs, and blocks before the
+  relative-logit table skip the bias and the mask. Microbench at 262K context, 8 verify tokens: 208 -> 431 GB/s.
+  DSpark step at 169K context 44.3 -> 34.2 ms; 252K context runs at 36.9 ms/step (76 tok/s); two concurrent 169K
+  requests 100.6 -> 145.6 tok/s in total.
+- DSpark draft head and Markov fold in FP8 (e4m3 weights, per-row scales; output-exact: verification still uses the BF16
+  target). Draft step -1.8 to -2.0 ms; +3.7 to +6.5% tok/s at T=1.0. +0.46 GB VRAM for the FP8 copies.
+- NVFP4 expert decode (1-2 tokens) with BF16 activations instead of MXFP8: SwiGLU fused into the w13 GEMV, one less
+  launch and no per-row activation copies per MoE layer. No-spec decode 77.0 -> 78.7 tok/s; DSpark steps 0.3-0.9 ms
+  faster. GGUF Q8 top-1 agreement unchanged (236-237 / 239). `VLLM_INKLING2_MXFP8_DECODE_ACT=1` restores the old path.
+- Release check (API, T=0, 512 tokens; v0.2.0 run in brackets): decode story 87.1 (78.7), code 116.1 (91.3), explain
+  86.5 (77.7) tok/s; prefill 4K / 16K / 64K 4557 / 4523 / 3728 tok/s (unchanged); KV pool 416,701 tokens (unchanged).
+- Build: `DEPS_IDX` build arg (defaults to the old index order) lets a local build fetch vLLM's dependencies from PyPI
+  first when AMD's wheel mirror is slow.
+
 ## v0.3.1 (2026-11-22)
 vLLM base `bf151b7eb1` (unchanged). Same weights and image; serve flag change only.
 - DSpark drafts are now sampled (`"draft_sample_method":"probabilistic"`) instead of argmax. Requests at the model's
