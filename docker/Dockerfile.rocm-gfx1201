@@ -28,6 +28,7 @@ RUN export PATH=$ROCM_PATH/bin:$PATH CMAKE_PREFIX_PATH=$ROCM_PATH MAX_JOBS=$MAX_
     && rm -rf build /root/.cargo/registry
 WORKDIR /
 # The R9700 tuning (GPU_MAX_HW_QUEUES=2 etc.) is applied by vLLM itself (vllm/platforms/rocm.py).
-ENV TRITON_CACHE_DIR=/root/.cache/triton VLLM_NO_USAGE_STATS=1
+# ROCPROFILER_REGISTER_ENABLED=0: stops ROCr's AsyncEventsLoop from busy-polling a CPU core at 100% while idle
+ENV TRITON_CACHE_DIR=/root/.cache/triton VLLM_NO_USAGE_STATS=1 ROCPROFILER_REGISTER_ENABLED=0
 EXPOSE 8005
 CMD ["vllm", "--help"]
