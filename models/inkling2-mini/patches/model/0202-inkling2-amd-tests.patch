@@ -1,0 +1,2177 @@
+redshift patch: model/0202-inkling2-amd-tests.patch
+cut from: b6faecc59a..93edd85693 -- tests
+commits:
+  85101d9f9d Abhinand B: [A] Inkling2 ROCm: enable gfx12x bring-up, keep SM12x checks CUDA-only
+  cc582f55e6 Abhinand B: [F] Inkling2 ROCm: support Inkling-2-Mini widths in MoE combine and SwiGLU quantize
+  5b4ffe131e Abhinand B: [C] Inkling2 ROCm: loop core (amd/loop.py, ops/loop.py), pass caches, fp32 attn_res
+  95e89bae46 Abhinand B: [C] Inkling2 ROCm: parse NVFP4/MXFP8 expert groups, load NVFP4 experts as stored
+  c49651debf Abhinand B: [F] Inkling2 ROCm: support Inkling-2-Mini widths in MoE combine and SwiGLU quantize
+  b73bd92396 Abhinand B: [B] Inkling2 ROCm MXFP8 BMM: gfx12 config table + fp8 WMMA kernel
+  7da296ada9 Abhinand B: [C] Inkling2 tests: ROCm loop paths, MXFP8 config for routed experts, torch loop reference (WIP)
+  778ed934bc Abhinand B: [F] Inkling2 ROCm: fused_add_rms_norm in one Triton launch
+  7653b233bd Abhinand B: [C] Inkling2 tests: fix the torch loop reference test
+  3bed451849 Abhinand B: [C] Inkling2 tests: tighter torch loop reference bound, looped routed-experts memory
+  b5110ac586 Abhinand B: [C] Inkling2 ROCm DSpark: Triton draft KV write, in-place refold
+  171b0ed6e7 Abhinand B: [C] Inkling2 tests: 0.10 GPU memory for DSpark generate tests
+  8a3404551f Abhinand B: [B] Inkling2 ROCm: gfx12 Triton NVFP4 expert GEMM replacing the torch placeholder
+  ed7a9b645b Abhinand B: [F] Inkling2 ROCm: one-row Triton GEMV for batch-1 decode linears
+  e348045c11 Abhinand B: [F] Inkling2 ROCm: unit-scale FP8 (E4M3) KV cache
+  b6eb181a6a Abhinand B: [K] Inkling2 ROCm DSpark: speculator_options draft_context caps the draft's global layer
+  a9ea12a065 Abhinand B: [P] Inkling2 tests: FP8 KV and 24/8-head prefill cases for rel_attention
+  ffcd7aed1b Abhinand B: [S] Inkling2 ROCm: 2-16 row Triton GEMV for spec-decode verify linears
+  92fd93a785 Abhinand B: [B] Inkling2 ROCm: NVFP4 decode GEMV (v_dot2, no WMMA) for plans of <= 64 tiles
+  d2632a0c6c Abhinand B: [S] Inkling2 ROCm: adaptive DSpark verification
+  d896b395af Abhinand B: [K] Inkling2 ROCm: tail-only conv-state cache manager
+  e926e520f2 Abhinand B: [K] Inkling2 ROCm DSpark: optional unit-scale FP8 draft KV cache
+  1735102bb6 Abhinand B: [K] Inkling2 DSpark test: stub the draft layer's _cache view in the KV write test
+  50f5d68b80 Abhinand B: [F] Inkling2 ROCm: one-launch segment GEMV for a batch-1 layer's projections
+  3a5cd3deb8 Abhinand B: [F] Inkling2 ROCm: loop pass messages in one launch, pair RMSNorm in the controller GEMV
+  f49c49681e Abhinand B: [F] Inkling2 ROCm: fused short conv + AttnRes mix for small batches
+  0db1b8ab9a Abhinand B: [B] Inkling2 ROCm NVFP4: run the decode GEMV only up to 2 tokens
+
+diff --git a/tests/models/inkling2/test_attention.py b/tests/models/inkling2/test_attention.py
+index 7b87b97c92..1b49dcd466 100644
+--- a/tests/models/inkling2/test_attention.py
++++ b/tests/models/inkling2/test_attention.py
+@@ -17,16 +17,19 @@ from vllm.platforms import current_platform
+ _cap = current_platform.get_device_capability() if current_platform.is_cuda() else None
+ _sm90 = _cap is not None and _cap.major in (9, 10, 11, 12)
+ _is_rocm = current_platform.is_rocm()
+-_gfx950 = _is_rocm and current_platform.is_device_capability(95)
++_rocm_arch = _is_rocm and (
++    current_platform.is_device_capability(95)
++    or current_platform.is_device_capability_family(120)
++)
+ requires_rocm = pytest.mark.skipif(
+-    not _gfx950, reason="ROCm Triton attention requires gfx950"
++    not _rocm_arch, reason="ROCm Triton attention requires gfx950 or gfx12"
+ )
+ requires_sm90 = pytest.mark.skipif(
+     not _sm90, reason="Inkling2 attention requires Hopper or Blackwell"
+ )
+ requires_rel_attention = pytest.mark.skipif(
+-    not (_sm90 or _gfx950),
+-    reason="Inkling2 attention requires Hopper, Blackwell or gfx950",
++    not (_sm90 or _rocm_arch),
++    reason="Inkling2 attention requires Hopper, Blackwell or gfx950/gfx12",
+ )
+ 
+ HEAD_DIM = 128
+@@ -189,6 +192,8 @@ def test_portable_attention_dequantizes_kv_before_mma(
+     [
+         (24, 8, 16, None, "prefill"),
+         (24, 8, 128, REL_EXTENT - 1, "chunked_prefill"),
++        (24, 8, 16, None, "chunked_prefill"),
++        (24, 8, 16, REL_EXTENT - 1, "prefill"),
+         (12, 2, 16, None, "prefill"),
+         (48, 8, 16, None, "prefill"),
+         (12, 2, 128, REL_EXTENT - 1, "prefill"),
+@@ -206,6 +211,10 @@ def test_portable_attention_dequantizes_kv_before_mma(
+     "num_splits,use_scheduler",
+     [(1, False)] if _is_rocm else [(1, True), (8, True), (8, False), (32, False)],
+ )
++# Unit-scale FP8 KV: ROCm only (the NVIDIA kernels are tested above).
++@pytest.mark.parametrize(
++    "kv_fp8", [False, pytest.param(True, marks=requires_rocm)] if _is_rocm else [False]
++)
+ @torch.inference_mode()
+ def test_inkling2_rel_attention(
+     num_heads,
+@@ -215,6 +224,7 @@ def test_inkling2_rel_attention(
+     scenario,
+     num_splits,
+     use_scheduler,
++    kv_fp8,
+ ):
+     if not _is_rocm:
+         from vllm.models.inkling2.nvidia.ops import use_sm100_kernels
+@@ -236,6 +246,9 @@ def test_inkling2_rel_attention(
+     kv[..., :HEAD_DIM] = torch.nn.functional.normalize(kv[..., :HEAD_DIM], dim=-1) * 2
+     kv = kv.bfloat16().transpose(1, 2)
+     key_cache, value_cache = kv.transpose(1, 2).split(HEAD_DIM, dim=-1)
++    if kv_fp8:
++        key_cache = key_cache.to(torch.float8_e4m3fn)
++        value_cache = value_cache.to(torch.float8_e4m3fn)
+     block_table = (
+         (torch.randperm(num_blocks - 1, device=device) + 1)[: len(seqs) * max_blocks]
+         .view(len(seqs), max_blocks)
+@@ -320,7 +333,14 @@ def test_inkling2_rel_attention(
+     lse = lse.t()
+ 
+     ref_out, ref_lse = _ref_attention(
+-        q, key_cache, value_cache, rel_logits, seqs, block_table, scale, window_left
++        q,
++        key_cache.bfloat16(),
++        value_cache.bfloat16(),
++        rel_logits,
++        seqs,
++        block_table,
++        scale,
++        window_left,
+     )
+     assert lse.shape == (num_tokens, num_heads) and lse.dtype == torch.float32
+     torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
+@@ -543,7 +563,7 @@ def test_inkling2_decode_attention_after_prologue(is_local, num_splits):
+ 
+ 
+ @pytest.mark.skipif(
+-    not _gfx950,
++    not _rocm_arch,
+     reason="ROCm's split merge reads the token count at replay (CUDA zeroes "
+     "padding rows by the captured count)",
+ )
+@@ -627,7 +647,8 @@ def test_inkling2_decode_graph_replays_smaller_batch(is_local, num_splits):
+ 
+ 
+ @pytest.mark.skipif(
+-    not (current_platform.is_cuda() or _gfx950), reason="requires CUDA or gfx950"
++    not (current_platform.is_cuda() or _rocm_arch),
++    reason="requires CUDA or gfx950/gfx12",
+ )
+ @pytest.mark.parametrize("num_tokens", [1, 300])
+ def test_gate_sink(num_tokens):
+diff --git a/tests/models/inkling2/test_core_ops.py b/tests/models/inkling2/test_core_ops.py
+index 91bdd7d34f..b4d40ec904 100644
+--- a/tests/models/inkling2/test_core_ops.py
++++ b/tests/models/inkling2/test_core_ops.py
+@@ -3,6 +3,7 @@
+ """Inkling2 core kernels against plain torch references of the same math."""
+ 
+ from collections.abc import Iterator
++from importlib import import_module
+ from types import SimpleNamespace
+ from typing import Any
+ 
+@@ -22,11 +23,20 @@ from vllm.models.inkling2.nvidia.ops.conv_mix import conv_mix
+ from vllm.platforms import current_platform
+ 
+ _is_rocm = current_platform.is_rocm()
++# The platform's implementation package (`vllm.models.inkling2` dispatches
++# the shared exports the same way).
++_impl = "vllm.models.inkling2." + ("amd" if _is_rocm else "nvidia")
+ 
+ pytestmark = pytest.mark.skipif(
+     not torch.cuda.is_available()
+-    or (_is_rocm and not current_platform.is_device_capability(95)),
+-    reason="needs CUDA or gfx950",
++    or (
++        _is_rocm
++        and not (
++            current_platform.is_device_capability(95)
++            or current_platform.is_device_capability_family(120)
++        )
++    ),
++    reason="needs CUDA or gfx950/gfx12",
+ )
+ 
+ DEVICE = "cuda"
+@@ -45,21 +55,24 @@ def test_rms_norm_rounds_once_to_bf16(in_dtype, width):
+ 
+ @pytest.mark.skipif(not _is_rocm, reason="CUDA runs flashinfer's fused_add_rmsnorm")
+ @pytest.mark.parametrize("rows", [1, 37])
+-def test_fused_add_rms_norm_matches_add_then_norm(rows):
++@pytest.mark.parametrize("width", [4608, 2304])
++def test_fused_add_rms_norm_matches_add_then_norm(rows, width):
+     """In place: `residual += x`, rounded once to bf16, and `x` = the RMSNorm
+     of the fp32 sum."""
+     from vllm.models.inkling2.amd.ops.norm import fused_add_rms_norm
+ 
+     torch.manual_seed(0)
+-    width = 4608
+     x = (torch.randn(rows, width, device=DEVICE) * 3).bfloat16()
+     residual = (torch.randn(rows, width, device=DEVICE) * 3).bfloat16()
+     weight = torch.randn(width, device=DEVICE).bfloat16()
+     total = x.float() + residual.float()
+     ref = total * torch.rsqrt(total.square().mean(-1, keepdim=True) + 1e-6)
+     ref = (ref * weight.float()).bfloat16()
++    unfused = rms_norm(total, weight, 1e-6, torch.bfloat16)
+     fused_add_rms_norm(x, residual, weight, 1e-6)
+     assert torch.equal(residual, total.bfloat16())
++    # One launch, bitwise the separate add and `rms_norm` of the fp32 sum.
++    assert torch.equal(x, unfused)
+     torch.testing.assert_close(x, ref, atol=0, rtol=1e-2)
+ 
+ 
+@@ -67,7 +80,7 @@ def test_fused_add_rms_norm_matches_add_then_norm(rows):
+ @pytest.mark.parametrize("broadcast", [False, True])
+ def test_loop_norm_preserves_stacked_reference_and_graph(tokens, broadcast):
+     """The fused upstream pair norm preserves direct-write normalization."""
+-    from vllm.models.inkling2.nvidia.ops.loop import pair_rms_norm
++    pair_rms_norm = import_module(f"{_impl}.ops.loop").pair_rms_norm
+ 
+     torch.manual_seed(42)
+     streams, width = 3, 2304
+@@ -283,15 +296,14 @@ def test_attn_res_without_norm_returns_fp32_mix(num_stack, with_addend, tokens):
+     torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-4)
+ 
+ 
+-@pytest.mark.parametrize("tokens", [1, 300])
++@pytest.mark.parametrize("tokens", [1, 8, 300])
+ def test_loop_blend_matches_per_stream_controllers(tokens):
+     """The stream-batched controllers (shared `dest` and norm weight, as a
+     local layer's q/k/v) equal each stream's reference controller followed by
+     its RMSNorm."""
+-    from vllm.models.inkling2.nvidia.loop import (
+-        Inkling2LoopDecoderLayer,
+-        Inkling2MessageController,
+-    )
++    loop = import_module(f"{_impl}.loop")
++    Inkling2LoopDecoderLayer = loop.Inkling2LoopDecoderLayer
++    Inkling2MessageController = loop.Inkling2MessageController
+ 
+     dim, rank, streams = 2304, 64, 3
+     down = torch.randn(streams, rank, 2 * dim, device=DEVICE) * 0.02
+@@ -489,6 +501,83 @@ def test_conv_mix_matches_conv_then_attn_res(
+         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+ 
+ 
++@pytest.mark.skipif(not _is_rocm, reason="the ROCm fused conv + mix")
++@pytest.mark.parametrize(
++    "num_stack,num_q,with_last,with_residual",
++    [
++        (1, 1, True, False),
++        (2, 1, False, False),
++        (3, 1, False, True),
++        (5, 3, False, True),
++        (4, 3, False, False),
++    ],
++)
++@pytest.mark.parametrize("dim", [2304, 4608])
++@pytest.mark.parametrize("with_norm", [True, False])
++@pytest.mark.parametrize("steps", [STEPS, LONG_STEPS])
++def test_rocm_conv_mix_matches_conv_then_attn_res(
++    num_stack, num_q, with_last, with_residual, dim, with_norm, steps
++):
++    """The ROCm `conv_mix` (one launch for small batches) equals
++    `short_conv` then `attn_res` bit for bit: conv output, conv-state cache
++    and mixes, over chunked prefill and decode steps."""
++    from vllm.models.inkling2.amd.ops.sconv import conv_mix as rocm_conv_mix
++
++    block, heads, offset = 4, 2, 256
++    stream_width = dim // heads
++    row = offset + stream_width
++    weight = torch.randn(dim, 4, device=DEVICE).bfloat16()
++    queries = torch.randn(num_q, dim, device=DEVICE) * dim**-0.5
++    norm_w = torch.randn(num_q, dim, device=DEVICE).bfloat16() if with_norm else None
++    eps = 1e-6 if with_norm else 0.0
++    cache, block_table = _conv_cache_and_table(heads, block, row, 64)
++    ref_cache = cache.clone()
++    for _, _, _, meta in _chunked_steps(steps, block_table, block):
++        tokens = meta[0].shape[0]
++        x = torch.randn(tokens, dim, device=DEVICE).bfloat16()
++        stack = torch.randn(num_stack, tokens, dim, device=DEVICE).bfloat16()
++        last = torch.randn(tokens, dim, device=DEVICE).bfloat16()
++        addend = torch.randn(tokens, dim, device=DEVICE).bfloat16()
++        residual = torch.randn(tokens, dim, device=DEVICE).bfloat16()
++        ref_conv = residual.clone() if with_residual else None
++        ref_conv = short_conv(
++            x,
++            weight,
++            ref_cache,
++            *meta,
++            offset,
++            stream_width,
++            addend if with_residual else None,
++            ref_conv,
++            ref_conv,
++        )
++        if with_last:
++            ref = attn_res(stack, last, ref_conv, queries, norm_w, eps, True)
++        else:
++            ref = attn_res(stack, ref_conv, None, queries, norm_w, eps, True)
++        # The residual is updated in place, as the model's MLP conv.
++        conv = residual.clone() if with_residual else torch.empty_like(last)
++        out = rocm_conv_mix(
++            x,
++            weight,
++            cache,
++            *meta,
++            offset,
++            stream_width,
++            conv,
++            conv if with_residual else None,
++            addend if with_residual else None,
++            stack,
++            last if with_last else None,
++            queries,
++            norm_w,
++            eps,
++        )
++        torch.testing.assert_close(conv, ref_conv, atol=0, rtol=0)
++        torch.testing.assert_close(cache, ref_cache, atol=0, rtol=0)
++        torch.testing.assert_close(out, ref, atol=0, rtol=0)
++
++
+ @pytest.mark.parametrize("split", [False, True])
+ @pytest.mark.parametrize("dynamic", [False, True])
+ def test_attention_prologue_writes_clipped_k_and_normed_v(dynamic, split, monkeypatch):
+@@ -633,7 +722,12 @@ def test_attention_prologue_stores_low_precision_kv_without_touching_padding(
+ 
+ 
+ @pytest.mark.parametrize(
+-    "tokens", [1, 4, 8, 16] if current_platform.is_device_capability_family(120) else []
++    "tokens",
++    [1, 4, 8, 16]
++    if (
++        current_platform.is_cuda() and current_platform.is_device_capability_family(120)
++    )
++    else [],
+ )
+ @pytest.mark.parametrize("shape", [(131, 130), (6552, 2304)])
+ @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@@ -688,3 +782,215 @@ def test_sm12x_linear_large_batch_fallback():
+     weight = torch.randn(129, 256, device=DEVICE).bfloat16()
+     expected = torch.nn.functional.linear(x, weight)
+     torch.testing.assert_close(linear(x, weight), expected, atol=0, rtol=0)
++
++
++@pytest.mark.skipif(not _is_rocm, reason="ROCm one-row GEMV")
++@pytest.mark.parametrize(
++    "streams, n, k, out_dtype",
++    [
++        (0, 8600, 2304, None),  # qkvr
++        (0, 2304, 3072, None),  # wo_ud
++        (0, 1024, 2304, None),  # k / v rows of qkvr
++        (0, 32, 2304, None),  # dynamic conv taps
++        (0, 131, 130, None),  # tails in N and K
++        (3, 64, 4608, None),  # loop controller down
++        (3, 4608, 64, torch.float32),  # loop controller gain / forget
++    ],
++)
++def test_rocm_gemv_matches_fp64_and_graph(streams, n, k, out_dtype):
++    """One-row decode GEMV: fp32-accumulated `x @ w.T` within output rounding
++    of fp64, on row-strided weight slices, and stable under graph replay."""
++    from vllm.models.inkling2.amd.ops.linear import decode_linear, gemv
++
++    torch.manual_seed(0)
++    s = max(streams, 1)
++    # Rows of a wider tensor (the projections slice qkvr's rows and stacks).
++    weight = (torch.randn(s, n + 5, k, device=DEVICE) * k**-0.5).bfloat16()[
++        :, 2 : n + 2
++    ]
++    x = torch.randn(s, 1, k + 8, device=DEVICE).bfloat16()[..., :k]
++    args = (x, weight) if streams else (x[0], weight[0])
++
++    def run():
++        if streams or out_dtype is not None:
++            return gemv(*args, out_dtype)
++        return decode_linear(*args)
++
++    def check(out):
++        ref = torch.einsum("snk,sk->sn", weight.double(), x[:, 0].double())
++        ref = ref if streams else ref[0]
++        out = out[:, 0] if streams else out[0]
++        dtype = out_dtype or torch.bfloat16
++        assert out.dtype == dtype
++        rounding = (ref.to(dtype).double() - ref).abs()
++        assert ((out.double() - ref).abs() <= 1e-4 + rounding).all()
++
++    check(run())
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        out = run()
++    for _ in range(2):
++        x.copy_(torch.randn_like(x))
++        graph.replay()
++        check(out)
++
++
++@pytest.mark.skipif(not _is_rocm, reason="ROCm multi-row GEMV")
++@pytest.mark.parametrize("rows", [2, 3, 8, 16])
++@pytest.mark.parametrize(
++    "streams, n, k, out_dtype",
++    [
++        (0, 8600, 2304, None),  # qkvr
++        (0, 2304, 3072, None),  # wo_ud
++        (0, 2304, 9216, None),  # draft down_proj
++        (0, 131, 130, None),  # tails in N and K
++        (3, 64, 4608, None),  # loop controller down
++        (1, 64, 4608, None),  # loop controller down, one stream
++        (3, 4608, 64, torch.float32),  # loop controller gain / forget
++    ],
++)
++def test_rocm_gemv_rows_matches_fp64_and_graph(rows, streams, n, k, out_dtype):
++    """2..16-row GEMV (spec-decode verify windows): fp32-accumulated
++    `x @ w.T` within output rounding of fp64 for every row, on row-strided
++    weight slices and inputs, and stable under graph replay."""
++    from vllm.models.inkling2.amd.ops.linear import decode_linear, gemv_rows
++
++    torch.manual_seed(0)
++    s = max(streams, 1)
++    weight = (torch.randn(s, n + 5, k, device=DEVICE) * k**-0.5).bfloat16()[
++        :, 2 : n + 2
++    ]
++    x = torch.randn(s, rows, k + 8, device=DEVICE).bfloat16()[..., :k]
++    args = (x, weight) if streams else (x[0], weight[0])
++
++    def run():
++        if streams or out_dtype is not None:
++            return gemv_rows(*args, out_dtype)
++        return decode_linear(*args)
++
++    def check(out):
++        ref = torch.einsum("snk,smk->smn", weight.double(), x.double())
++        ref = ref if streams else ref[0]
++        dtype = out_dtype or torch.bfloat16
++        assert out.dtype == dtype and out.shape == ref.shape
++        rounding = (ref.to(dtype).double() - ref).abs()
++        assert ((out.double() - ref).abs() <= 1e-4 + rounding).all()
++
++    check(run())
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        out = run()
++    for _ in range(2):
++        x.copy_(torch.randn_like(x))
++        graph.replay()
++        check(out)
++
++
++@pytest.mark.skipif(not _is_rocm, reason="ROCm multi-row GEMV")
++@pytest.mark.parametrize("config", [(4, 2, 512, 1, 4), (4, 2, 512, 2, 8)])
++def test_rocm_gemv_rows_fma_modes_match_fp64(config):
++    """The fp32-FMA tiles (chunk- and late-reduced) the tuner may pick."""
++    from vllm.models.inkling2.amd.ops.linear import gemv_rows
++
++    torch.manual_seed(0)
++    x = torch.randn(3, 1000, device=DEVICE).bfloat16()
++    weight = (torch.randn(77, 1000, device=DEVICE) * 0.03).bfloat16()
++    out = gemv_rows(x, weight, config=config)
++    ref = x.double() @ weight.double().T
++    rounding = (ref.bfloat16().double() - ref).abs()
++    assert ((out.double() - ref).abs() <= 1e-4 + rounding).all()
++
++
++@pytest.mark.skipif(not _is_rocm, reason="ROCm one-row GEMV")
++@pytest.mark.parametrize("rows", [17, 33])
++def test_rocm_decode_linear_keeps_hipblaslt_for_batches(rows):
++    """More than 16 rows (prefill) stay on `linear`, bitwise."""
++    from vllm.models.inkling2.amd.ops.linear import decode_linear
++
++    x = torch.randn(rows, 2304, device=DEVICE).bfloat16()
++    weight = torch.randn(1024, 2304, device=DEVICE).bfloat16()
++    expected = torch.nn.functional.linear(x, weight)
++    torch.testing.assert_close(decode_linear(x, weight), expected, atol=0, rtol=0)
++
++
++@pytest.mark.skipif(not _is_rocm, reason="ROCm one-row GEMV")
++@pytest.mark.parametrize(
++    "sizes",
++    [
++        (6560, 1024, 1024, 32, 32),  # full layer: q side, k, v, k/v taps
++        (4616, 1024, 1024),  # looped local layer
++        (131, 7),
++    ],
++)
++def test_rocm_segment_gemv_matches_gemvs_and_graph(sizes):
++    """`segment_gemv` equals one `gemv` per (input, weight) pair bit for bit,
++    on row slices of a wider weight, and under graph replay."""
++    from vllm.models.inkling2.amd.ops.linear import gemv
++    from vllm.models.inkling2.amd.ops.segment_gemv import segment_gemv
++
++    torch.manual_seed(0)
++    k = 2304
++    big = (torch.randn(sum(sizes) + 9, k, device=DEVICE) * k**-0.5).bfloat16()
++    weights = list(big[3 : 3 + sum(sizes)].split(sizes))
++    xs = torch.randn(3, 1, k, device=DEVICE).bfloat16()
++    pairs = [(xs[i % 3], w) for i, w in enumerate(weights)]
++
++    def check(outs):
++        assert len(outs) == len(pairs)
++        for out, (x, w) in zip(outs, pairs):
++            torch.testing.assert_close(out, gemv(x, w), atol=0, rtol=0)
++
++    check(segment_gemv(pairs))
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        outs = segment_gemv(pairs)
++    for _ in range(2):
++        xs.copy_(torch.randn_like(xs))
++        graph.replay()
++        check(outs)
++
++
++@pytest.mark.skipif(not _is_rocm, reason="ROCm one-row GEMV")
++@pytest.mark.parametrize("broadcast", [False, True])
++def test_rocm_pair_norm_gemv_matches_norm_then_gemv(broadcast):
++    """The loop controller's first one-token GEMV with the pair RMSNorm
++    folded in equals `pair_rms_norm` then `gemv` bit for bit."""
++    from vllm.models.inkling2.amd.ops.linear import gemv
++    from vllm.models.inkling2.amd.ops.loop import pair_norm_gemv, pair_rms_norm
++
++    torch.manual_seed(0)
++    streams, d, rank = 3, 2304, 64
++    message = torch.randn(streams, 1, d, device=DEVICE) * 3
++    dest = torch.randn(1 if broadcast else streams, 1, d, device=DEVICE)
++    dest = dest.expand(streams, -1, -1)
++    weight = (torch.randn(streams + 1, rank, 2 * d, device=DEVICE) * 0.02).bfloat16()
++    weight = weight[1:]
++    ref = gemv(pair_rms_norm(dest, message), weight)
++    torch.testing.assert_close(
++        pair_norm_gemv(dest, message, weight), ref, atol=0, rtol=0
++    )
++
++
++@pytest.mark.parametrize("tokens", [1, 5, 16])
++def test_attn_res_batched_queries_match_per_layer(tokens):
++    """A loop pass's messages for every core layer in one `attn_res` launch
++    (`select_q` = the four streams) equal each layer's four-query launch bit
++    for bit."""
++    torch.manual_seed(0)
++    layers, streams, dim = 12, 4, 2304
++    bank = torch.randn(2, tokens, dim, device=DEVICE).bfloat16()
++    queries = torch.randn(layers, streams, dim, device=DEVICE) * dim**-0.5
++    batched = attn_res(
++        bank[:1],
++        bank[1],
++        None,
++        queries.view(-1, dim),
++        None,
++        0.0,
++        True,
++        select_q=streams,
++    )
++    for layer in range(layers):
++        ref = attn_res(bank[:1], bank[1], None, queries[layer], None, 0.0, True)
++        rows = batched[layer * streams : (layer + 1) * streams]
++        torch.testing.assert_close(rows, ref, atol=0, rtol=0)
+diff --git a/tests/models/inkling2/test_dspark.py b/tests/models/inkling2/test_dspark.py
+index bb3bd35a13..73841a296e 100644
+--- a/tests/models/inkling2/test_dspark.py
++++ b/tests/models/inkling2/test_dspark.py
+@@ -3,6 +3,7 @@
+ """Inkling2 DSpark draft components against torch ports of the reference
+ implementation."""
+ 
++from functools import partial
+ from types import SimpleNamespace
+ 
+ import pytest
+@@ -15,11 +16,19 @@ _is_rocm = current_platform.is_rocm()
+ if not (
+     current_platform.is_device_capability_family(100)
+     or current_platform.is_device_capability(90)
+-    or current_platform.is_device_capability_family(120)
+-    or (_is_rocm and current_platform.is_device_capability(95))
++    or (
++        current_platform.is_cuda() and current_platform.is_device_capability_family(120)
++    )
++    or (
++        _is_rocm
++        and (
++            current_platform.is_device_capability(95)
++            or current_platform.is_device_capability_family(120)
++        )
++    )
+ ):
+     pytest.skip(
+-        "Inkling2 requires Hopper, Blackwell or gfx950", allow_module_level=True
++        "Inkling2 requires Hopper, Blackwell or gfx950/gfx12", allow_module_level=True
+     )
+ 
+ from vllm.models.inkling2 import (  # noqa: E402
+@@ -144,6 +153,45 @@ def test_block_attention_anchored_window(is_local, num_splits):
+     assert (out[len(context_lens) * block :] == 0).all()
+ 
+ 
++@pytest.mark.skipif(not _is_rocm, reason="the ROCm draft's own KV write")
++def test_draft_kv_write_matches_cache_layout():
++    """The ROCm draft scatters K/V into the `[blocks, block_size, kv_heads,
++    (K | V)]` cache `block_decode_attention` reads; padded tokens beyond the
++    slot mapping and `-1` slots write nothing."""
++    from vllm.models.inkling2.amd.dspark import Inkling2DraftSelfAttention
++
++    g = torch.Generator().manual_seed(855)
++    num_blocks, page, num_kv_heads, head_dim = 6, 16, 2, 128
++    num_slots, num_padded = 21, 24
++    kv = torch.zeros(
++        num_blocks, page, num_kv_heads, 2 * head_dim, dtype=torch.bfloat16
++    ).to(DEVICE)
++    # As the backend hands it to the layer: (blocks, heads, block_size, 2 D).
++    attn = SimpleNamespace(
++        kv_cache=kv.transpose(1, 2),
++        kv_cache_dtype="auto",
++        _k_scale=torch.ones((), device=DEVICE),
++        _v_scale=torch.ones((), device=DEVICE),
++    )
++    # k contiguous, v a column slice of a fused projection (as in the model).
++    k = torch.randn(num_padded, num_kv_heads, head_dim, generator=g).bfloat16()
++    kv_proj = torch.randn(num_padded, 3 * num_kv_heads * head_dim, generator=g)
++    k, kv_proj = k.to(DEVICE), kv_proj.bfloat16().to(DEVICE)
++    v = kv_proj[:, : num_kv_heads * head_dim].view(-1, num_kv_heads, head_dim)
++    slots = torch.randperm(num_blocks * page, generator=g)[:num_slots]
++    slots[3] = -1
++    slots = slots.to(DEVICE)
++    layer = SimpleNamespace(attn=attn, head_dim=head_dim)
++    layer._cache = partial(Inkling2DraftSelfAttention._cache, layer)
++    Inkling2DraftSelfAttention._write_kv(layer, k, v, slots)
++
++    ref = torch.zeros_like(kv).flatten(0, 1)
++    keep = slots >= 0
++    ref[slots[keep], :, :head_dim] = k[:num_slots][keep]
++    ref[slots[keep], :, head_dim:] = v[:num_slots][keep]
++    assert torch.equal(kv.flatten(0, 1), ref)
++
++
+ def _all_reduce_norm_worker(rank: int, world: int, port: int, queue) -> None:
+     from tests.utils import init_test_distributed_environment
+     from vllm.distributed import (
+diff --git a/tests/models/inkling2/test_model.py b/tests/models/inkling2/test_model.py
+index f15e81189d..b3a2709538 100644
+--- a/tests/models/inkling2/test_model.py
++++ b/tests/models/inkling2/test_model.py
+@@ -4,6 +4,8 @@
+ 
+ import copy
+ import json
++from functools import partial
++from importlib import import_module
+ from typing import Any
+ 
+ import pytest
+@@ -22,13 +24,25 @@ from vllm.platforms import current_platform
+ if not (
+     current_platform.is_device_capability_family(100)
+     or current_platform.is_device_capability(90)
+-    or current_platform.is_device_capability_family(120)
+-    or (current_platform.is_rocm() and current_platform.is_device_capability(95))
++    or (
++        current_platform.is_cuda() and current_platform.is_device_capability_family(120)
++    )
++    or (
++        current_platform.is_rocm()
++        and (
++            current_platform.is_device_capability(95)
++            or current_platform.is_device_capability_family(120)
++        )
++    )
+ ):
+     pytest.skip(
+-        "Inkling2 requires Hopper, Blackwell or gfx950", allow_module_level=True
++        "Inkling2 requires Hopper, Blackwell or gfx950/gfx12", allow_module_level=True
+     )
+ 
++# The platform's implementation package (`vllm.models.inkling2` dispatches
++# the shared exports the same way).
++_IMPL = "vllm.models.inkling2." + ("amd" if current_platform.is_rocm() else "nvidia")
++
+ NUM_LAYERS = 2
+ TINY_CONFIG: dict[str, Any] = {
+     "architectures": ["Inkling2ForConditionalGeneration"],
+@@ -252,7 +266,7 @@ def test_portable_fp16_kv_config(tmp_path, looped):
+         max_model_len=2048,
+     )
+     cache = CacheConfig(cache_dtype="float16")
+-    if current_platform.is_device_capability_family(120):
++    if current_platform.is_cuda() and current_platform.is_device_capability_family(120):
+         config = VllmConfig(model_config=model, cache_config=cache)
+         assert config.model_config.dtype == torch.bfloat16
+         assert config.cache_config.cache_dtype == "float16"
+@@ -278,7 +292,15 @@ def test_portable_fp16_kv_config(tmp_path, looped):
+             (None, "fp8_e4m3", "humming"),
+             ("greedy", "fp8_e4m3", "humming"),
+         ]
+-        if current_platform.is_device_capability_family(120)
++        if (
++            current_platform.is_cuda()
++            and current_platform.is_device_capability_family(120)
++        )
++        else [
++            (None, "fp8_e4m3", "auto"),
++            ("greedy", "fp8_e4m3", "auto"),
++        ]
++        if current_platform.is_rocm()
+         else []
+     ),
+ )
+@@ -307,11 +329,20 @@ def test_tiny_model_generates(
+         tokenizer_mode="hf",
+         kv_cache_dtype=kv_cache_dtype,
+         kernel_config={"moe_backend": moe_backend},
+-        gpu_memory_utilization=0.10 if looped else 0.035,
++        # 0.035 of a 32 GB gfx1201 leaves no KV blocks next to the DSpark
++        # draft (ROCm context, HIP graphs and warmup reserve take ~1.1 GiB).
++        gpu_memory_utilization=(
++            0.10 if looped or draft_sample_method is not None else 0.035
++        ),
+         # Bound SM12x warmup memory and exercise chunking of the 298-token
+         # prompt. On B200 this budget faulted in the TRT-LLM NVFP4 expert GEMM.
+         max_num_batched_tokens=(
+-            256 if current_platform.is_device_capability_family(120) else None
++            256
++            if (
++                current_platform.is_cuda()
++                and current_platform.is_device_capability_family(120)
++            )
++            else None
+         ),
+         max_model_len=2048,
+         max_num_seqs=4,
+@@ -355,6 +386,319 @@ def test_tiny_model_generates(
+         assert 0 <= accepted <= drafted
+ 
+ 
++@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm DSpark glue")
++def test_tiny_model_adaptive_verification(tmp_path):
++    """Adaptive verification (per-request draft budgets trimmed on device)
++    replays the varlen verify graphs of the conv-state and attention
++    builders: two requests of different lengths decode with greedy DSpark
++    drafts, and the acceptance metrics stay consistent."""
++    model = _write_model(tmp_path, copy.deepcopy(TINY_LOOP_CONFIG))
++    llm = LLM(
++        speculative_config={
++            "method": "dspark",
++            "num_speculative_tokens": 7,
++            "draft_sample_method": "greedy",
++            "enable_adaptive_verification": True,
++        },
++        model=model,
++        load_format="dummy",
++        skip_tokenizer_init=True,
++        tokenizer_mode="hf",
++        gpu_memory_utilization=0.10,
++        max_model_len=2048,
++        max_num_seqs=4,
++        limit_mm_per_prompt={"image": 0},
++        disable_log_stats=False,
++    )
++    prompts = [list(range(2, 300)), [5, 5, 5]]
++    outputs = llm.generate(
++        [{"prompt_token_ids": p} for p in prompts],
++        SamplingParams(max_tokens=40, temperature=0, ignore_eos=True, detokenize=False),
++    )
++    for output in outputs:
++        token_ids = output.outputs[0].token_ids
++        assert len(token_ids) == 40
++        assert all(0 <= t < 1000 for t in token_ids)
++    from tests.v1.e2e.spec_decode.utils import get_spec_decode_metric_value
++
++    metrics = llm.get_metrics()
++    drafted = get_spec_decode_metric_value(metrics, "vllm:spec_decode_num_draft_tokens")
++    accepted = get_spec_decode_metric_value(
++        metrics, "vllm:spec_decode_num_accepted_tokens"
++    )
++    assert drafted > 0
++    assert 0 <= accepted <= drafted
++
++
++def _draft_attention_windows(worker) -> dict[str, int | None]:
++    context = worker.model_runner.vllm_config.compilation_config.static_forward_context
++    return {
++        name: layer.sliding_window
++        for name, layer in context.items()
++        if name.endswith(".self_attn.attn")
++    }
++
++
++def _draft_cache_dtypes(worker) -> set[torch.dtype]:
++    context = worker.model_runner.vllm_config.compilation_config.static_forward_context
++    return {
++        layer.kv_cache.dtype
++        for name, layer in context.items()
++        if name.endswith(".self_attn.attn")
++    }
++
++
++@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm DSpark draft")
++@pytest.mark.parametrize("draft_kv_dtype", ["auto", "fp8"])
++def test_tiny_model_draft_context(tmp_path, enable_pickle, draft_kv_dtype):
++    """`speculator_options.draft_context` turns the draft's global layer into
++    a sliding window over that many positions (smaller than the prompt here),
++    so its KV cache is a window's, and greedy decoding still runs and accepts
++    drafts, with a BF16 or a unit-scale FP8 draft cache."""
++    model = _write_model(tmp_path, copy.deepcopy(TINY_LOOP_CONFIG))
++    llm = LLM(
++        speculative_config={
++            "method": "dspark",
++            "num_speculative_tokens": 7,
++            "speculator_options": {"draft_context": 64},
++            "kv_cache_dtype": draft_kv_dtype,
++        },
++        model=model,
++        load_format="dummy",
++        skip_tokenizer_init=True,
++        tokenizer_mode="hf",
++        gpu_memory_utilization=0.10,
++        max_model_len=2048,
++        max_num_seqs=4,
++        limit_mm_per_prompt={"image": 0},
++        disable_log_stats=False,
++    )
++    windows = llm.collective_rpc(_draft_attention_windows)[0]
++    local = TINY_LOOP_CONFIG["mtp_config"]["local_layer_ids"]
++    window = TINY_LOOP_CONFIG["mtp_config"]["sliding_window_size"]
++    assert windows == {
++        f"model.layers.{i}.self_attn.attn": window if i in local else 64
++        for i in range(TINY_LOOP_CONFIG["mtp_config"]["num_hidden_layers"])
++    }
++    assert llm.collective_rpc(_draft_cache_dtypes)[0] == {
++        torch.uint8 if draft_kv_dtype == "fp8" else torch.bfloat16
++    }
++    outputs = llm.generate(
++        [{"prompt_token_ids": list(range(2, 300))}, {"prompt_token_ids": [5, 5, 5]}],
++        SamplingParams(max_tokens=24, temperature=0, ignore_eos=True, detokenize=False),
++    )
++    for output in outputs:
++        token_ids = output.outputs[0].token_ids
++        assert len(token_ids) == 24 and all(0 <= t < 1000 for t in token_ids)
++    from tests.v1.e2e.spec_decode.utils import get_spec_decode_metric_value
++
++    drafted = get_spec_decode_metric_value(
++        llm.get_metrics(), "vllm:spec_decode_num_draft_tokens"
++    )
++    assert drafted > 0
++
++
++@pytest.mark.parametrize(
++    "options,match",
++    [
++        ({"draft_ctx": 4}, "Unknown Inkling2 DSpark speculator_options"),
++        ({"draft_context": -1}, "non-negative integer"),
++        ({"draft_context": 1.5}, "non-negative integer"),
++    ],
++)
++def test_draft_context_option_validation(tmp_path, options, match):
++    from vllm.config import ParallelConfig, SpeculativeConfig
++    from vllm.config.model import ModelConfig
++
++    model = _write_model(tmp_path, copy.deepcopy(TINY_LOOP_CONFIG))
++    target = ModelConfig(model=model, tokenizer_mode="hf", skip_tokenizer_init=True)
++    with pytest.raises(ValueError, match=match):
++        SpeculativeConfig(
++            method="dspark",
++            num_speculative_tokens=7,
++            speculator_options=options,
++            target_model_config=target,
++            target_parallel_config=ParallelConfig(),
++        )
++
++
++def _conv_managers(worker) -> set[str]:
++    groups = worker.model_runner.kv_cache_config.kv_cache_groups
++    return {
++        g.manager_cls.__name__
++        for g in groups
++        if any(name.endswith(".conv_state") for name in g.layer_names)
++        or any(".conv_state." in name for name in g.layer_names)
++    }
++
++
++def _poison_null_block(worker) -> None:
++    """Fill block 0 (the null block) of every paged cache with NaN before
++    each forward: a read of a null block-table entry then shows up as NaN."""
++    runner = worker.model_runner
++    context = runner.vllm_config.compilation_config.static_forward_context
++    caches = [
++        layer.kv_cache
++        for layer in context.values()
++        if isinstance(getattr(layer, "kv_cache", None), torch.Tensor)
++        and layer.kv_cache.numel() > 0
++    ]
++    assert caches
++
++    def poison(*_):
++        for cache in caches:
++            # uint8 is FP8 storage: 0xFF is E4M3 NaN.
++            cache[0].fill_(255 if cache.dtype == torch.uint8 else float("nan"))
++
++    runner.model.register_forward_pre_hook(poison)
++
++
++def _conv_cache_run(
++    model: str,
++    monkeypatch,
++    *,
++    tail_only: bool,
++    speculate: bool = False,
++    poison: bool = False,
++    enforce_eager: bool = False,
++    prefix_caching: bool = False,
++    prompts: list[list[int]],
++    max_tokens: int = 16,
++    prompt_logprobs: bool = True,
++):
++    from vllm.models.inkling2.amd.sconv import Inkling2ConvState
++
++    # In-process engine so the manager switch reaches the worker.
++    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
++    monkeypatch.setattr(Inkling2ConvState, "tail_only", tail_only)
++    llm = LLM(
++        speculative_config=(
++            {"method": "dspark", "num_speculative_tokens": 7} if speculate else None
++        ),
++        model=model,
++        load_format="dummy",
++        skip_tokenizer_init=True,
++        tokenizer_mode="hf",
++        gpu_memory_utilization=0.10,
++        # 64-token chunks: a chunk's interior conv blocks are left null.
++        max_num_batched_tokens=64,
++        max_model_len=2048,
++        max_num_seqs=4,
++        enforce_eager=enforce_eager,
++        enable_prefix_caching=prefix_caching,
++        limit_mm_per_prompt={"image": 0},
++    )
++    managers = llm.collective_rpc(_conv_managers)[0]
++    assert managers == {
++        "TailSlidingWindowManager" if tail_only else "SlidingWindowManager"
++    }
++    if poison:
++        llm.collective_rpc(_poison_null_block)
++    results = []
++    for prompt in prompts:
++        # One request at a time: the same batches with either manager.
++        out = llm.generate(
++            [{"prompt_token_ids": prompt}],
++            SamplingParams(
++                max_tokens=max_tokens,
++                temperature=0,
++                logprobs=0,
++                # Prompt logprobs skip prefix-cache reads.
++                prompt_logprobs=0 if prompt_logprobs else None,
++                ignore_eos=True,
++                detokenize=False,
++            ),
++        )[0]
++        completion = out.outputs[0]
++        assert completion.logprobs is not None
++        results.append(
++            (
++                out.num_cached_tokens,
++                [
++                    next(iter(d.values())).logprob
++                    for d in out.prompt_logprobs or [None]
++                    if d
++                ],
++                list(completion.token_ids),
++                [
++                    lp[t].logprob
++                    for lp, t in zip(completion.logprobs, completion.token_ids)
++                ],
++            )
++        )
++    del llm
++    cleanup_dist_env_and_memory()
++    return results
++
++
++@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm conv manager")
++@pytest.mark.parametrize("speculate", [False, True])
++def test_conv_tail_cache_matches_window_cache(tmp_path, monkeypatch, speculate):
++    """The tail-only conv-state manager backs only the blocks a step can read
++    (the window before its first token), leaving a prefill chunk's interior
++    null: prefill and decode give bitwise the logprobs and tokens of the
++    sliding-window manager that backs every block in the window of a chunk,
++    with and without DSpark drafts in flight."""
++    model = _write_model(tmp_path, copy.deepcopy(TINY_LOOP_CONFIG))
++    prompts = [list(range(2, 302)), [5, 5, 5], list(range(40, 177))]
++    run = partial(
++        _conv_cache_run, model, monkeypatch, speculate=speculate, prompts=prompts
++    )
++    window = run(tail_only=False)
++    tail = run(tail_only=True)
++    assert tail == window
++
++
++@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm conv manager")
++def test_conv_tail_cache_never_reads_null_block(tmp_path, monkeypatch):
++    """The null block takes the interior writes of every prefill chunk;
++    nothing may read it back. With block 0 of every cache refilled with NaN
++    before each forward, the outputs are bitwise those of an unpoisoned run."""
++    model = _write_model(tmp_path, copy.deepcopy(TINY_LOOP_CONFIG))
++    prompts = [list(range(2, 302)), [5, 5, 5]]
++    run = partial(
++        _conv_cache_run,
++        model,
++        monkeypatch,
++        tail_only=True,
++        enforce_eager=True,
++        prompts=prompts,
++    )
++    clean = run()
++    poisoned = run(poison=True)
++    for _, prompt_lps, _, lps in poisoned:
++        assert all(x == x for x in prompt_lps + lps)  # no NaN
++    assert poisoned == clean
++
++
++@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm conv manager")
++def test_conv_tail_cache_prefix_hit(tmp_path, monkeypatch):
++    """A prefix-cache hit resumes at a backed conv block (a chunk end, as
++    chunk interiors are never cached): the hit request reads the cached conv
++    window before the hit and decodes like a full prefill."""
++    model = _write_model(tmp_path, copy.deepcopy(TINY_LOOP_CONFIG))
++    # 512 tokens: eight 64-token chunks, then the same prompt with a suffix.
++    shared = list(range(2, 514))
++    prompts = [shared, shared + list(range(600, 640))]
++    run = partial(
++        _conv_cache_run,
++        model,
++        monkeypatch,
++        tail_only=True,
++        max_tokens=8,
++        prompt_logprobs=False,
++    )
++    hit = run(prefix_caching=True, prompts=prompts)
++    full = run(prompts=prompts[1:])
++    assert hit[0][0] == 0
++    num_cached, _, tokens, lps = hit[1]
++    assert num_cached > 0 and num_cached % 64 == 0, num_cached
++    assert tokens == full[0][2]
++    torch.testing.assert_close(
++        torch.tensor(lps), torch.tensor(full[0][3]), rtol=0, atol=2e-2
++    )
++
++
+ def test_tiny_model_lora_with_quantized_experts(tmp_path):
+     """With LoRA enabled, the NVFP4 / MXFP8 experts are no LoRA target: the
+     engine starts (its warmup adapter covers every LoRA module) and decodes
+@@ -384,11 +728,12 @@ def _record_moe_routing(model: torch.nn.Module) -> None:
+     loop message controllers (dummy ones leave every pass alike), then
+     record, in call order, the torch reference routing of every MoE call's
+     input (sorted expert ids per token)."""
+-    from vllm.models.inkling2.nvidia.loop import Inkling2LoopDecoderLayer
+-    from vllm.models.inkling2.nvidia.moe import Inkling2MoE
+-    from vllm.models.inkling2.nvidia.ops.linear import linear_k_groups
+     from vllm.utils.gpu_sync_debug import gpu_sync_allowed
+ 
++    Inkling2LoopDecoderLayer = import_module(f"{_IMPL}.loop").Inkling2LoopDecoderLayer
++    Inkling2MoE = import_module(f"{_IMPL}.moe").Inkling2MoE
++    linear_k_groups = import_module(f"{_IMPL}.ops.linear").linear_k_groups
++
+     calls: list[torch.Tensor] = []
+     model.routing_calls = calls
+     generator = torch.Generator(device="cuda").manual_seed(0)
+@@ -423,13 +768,12 @@ def test_tiny_model_routed_experts(tmp_path, enable_pickle, looped):
+     order (a loop core layer has one per pass), each the experts that visit's
+     MoE call routed every prompt token to."""
+     config = TINY_LOOP_CONFIG if looped else TINY_CONFIG
+-    (tmp_path / "config.json").write_text(json.dumps(config))
+     llm = LLM(
+-        model=str(tmp_path),
++        model=_write_model(tmp_path, config),
+         load_format="dummy",
+         skip_tokenizer_init=True,
+         tokenizer_mode="hf",
+-        gpu_memory_utilization=0.035,
++        gpu_memory_utilization=0.10 if looped else 0.035,
+         max_model_len=2048,
+         max_num_seqs=4,
+         enforce_eager=True,
+@@ -459,6 +803,235 @@ def test_tiny_model_routed_experts(tmp_path, enable_pickle, looped):
+         assert not torch.equal(captured[:, 1], captured[:, 3])
+ 
+ 
++def _ref_rms(x: torch.Tensor, weight: torch.Tensor | None, eps: float) -> torch.Tensor:
++    y = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + eps)
++    return y if weight is None else y * weight.float()
++
++
++def _ref_mix(blocks, queries, norm_weight=None, norm_eps=0.0, addend=None):
++    """Block AttnRes (normalized values) of `blocks` (the last plus
++    `addend`, in fp32) with `queries` (Q, D): bf16 RMSNorm-ed with
++    `norm_weight` (Q, D), or fp32 without."""
++    values = torch.stack([b.float() for b in blocks])
++    if addend is not None:
++        values[-1] += addend.float()
++    inv_rms = torch.rsqrt(values.square().mean(-1) + 1e-6)
++    probs = torch.einsum("ntd,qd,nt->qtn", values, queries, inv_rms).softmax(-1)
++    mix = torch.einsum("qtn,ntd->qtd", probs, values * inv_rms[..., None])
++    if norm_weight is None:
++        return mix
++    return _ref_rms(mix, norm_weight[:, None], norm_eps).bfloat16()
++
++
++def _ref_conv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
++    """Causal depthwise static conv `(x + sum_lag w * x[t - lag]) *
++    (W + 1)**-0.5` of one sequence `x` (T, C), `weight` (C, 1, W): bf16."""
++    width = weight.shape[-1]
++    taps = weight.squeeze(1).float()
++    padded = torch.cat([x.new_zeros(width - 1, x.shape[1]), x]).float()
++    acc = torch.zeros_like(x, dtype=torch.float32)
++    for lag in reversed(range(width)):
++        acc += padded[width - 1 - lag : width - 1 - lag + len(x)] * taps[:, -1 - lag]
++    return ((acc + x.float()) * (width + 1) ** -0.5).bfloat16()
++
++
++def _ref_controller(layer, stream: int, dest, message, norm_weight, eps):
++    """A loop message controller on fp32 (T, D) inputs, then the RMSNorm."""
++    dim = dest.shape[-1]
++    down = layer.controller_down[stream].float()
++    gain = layer.controller_gain_forget[stream, :dim].float()
++    forget = layer.controller_gain_forget[stream, dim:].float()
++    pair = torch.cat((_ref_rms(dest, None, 1e-6), _ref_rms(message, None, 1e-6)), -1)
++    hidden = (pair.bfloat16().float() @ down.t()).bfloat16().float()
++    blended = (1 - torch.tanh(hidden @ forget.t())) * dest + torch.tanh(
++        hidden @ gain.t()
++    ) * message
++    return _ref_rms(blended, norm_weight, eps).bfloat16()
++
++
++def _kernel_mix(blocks, queries, norm_weight=None, norm_eps=0.0, addend=None):
++    """`_ref_mix` by the model's AttnRes kernel."""
++    from vllm.models.inkling2 import attn_res
++
++    last = blocks[-1]
++    stack = torch.stack(blocks[:-1]) if len(blocks) > 1 else last[None][:0]
++    return attn_res(stack, last, addend, queries, norm_weight, norm_eps, True)
++
++
++def _kernel_controller(layer, stream: int, dest, message, norm_weight, eps):
++    """`_ref_controller` by the model's controller kernels."""
++    one = slice(stream, stream + 1)
++    return layer.blend(one, dest[None], message[None], norm_weight[None], eps)[0]
++
++
++def _ref_loop_forward(
++    model, positions, embeds, mix=_ref_mix, controller=_ref_controller
++) -> torch.Tensor:
++    """A plain torch forward of `Inkling2LoopModel` (one prefill of one
++    sequence): visit order, pass restarts, the message bank, controllers,
++    AttnRes mixes, norms and the hidden-stream short convs. Attention and
++    MoE run the model's sublayers (their kernels have their own tests) with
++    each visit's loop pass."""
++    core = model.loop_core
++    queries = model.attn_res
++    visits = [(i, 0) for i in range(core.start)]
++    visits += [(i, p) for p in range(model.config.num_loop_passes) for i in core]
++    visits += [(i, 0) for i in range(core.stop, len(model.layers))]
++    tau = model._log_scaling_tau(positions)
++    completed: list[torch.Tensor] = []
++    partial = embeds
++    bank = prelude = None
++    for i, pass_idx in visits:
++        layer = model.layers[i]
++        if i == core.start and pass_idx == 0:
++            prelude = (list(completed), partial)
++        elif i == core.start:
++            assert prelude is not None
++            bank = [*completed, partial][len(prelude[0]) + 1 :]
++            assert len(bank) == 2
++            completed, partial = list(prelude[0]), prelude[1]
++        blocks = [*completed, partial]
++        norm = layer.attn_norm
++        messages = None
++        if pass_idx:
++            query = model.message_queries[i - core.start]
++            messages = mix(bank, query)
++            dests = mix(blocks, queries.attn_queries[i - 1])
++            dests = dests.expand(3, -1, -1) if layer.is_local else dests
++            weight = norm.weight.expand(3, -1) if layer.is_local else norm.weight
++            attn_inputs = [
++                controller(layer, s, dests[s], messages[s], weight[s], norm.eps)
++                for s in range(3)
++            ]
++        elif not completed:
++            attn_inputs = [
++                _ref_rms(partial, w, norm.eps).bfloat16() for w in norm.weight
++            ]
++        else:
++            attn_inputs = list(
++                mix(blocks, queries.attn_queries[i - 1], norm.weight, norm.eps)
++            )
++        attn = layer.attention(positions, attn_inputs, tau, pass_idx=pass_idx)
++        attn_out = _ref_conv(attn, layer.attn_sconv.weight)
++        first = i % model.block_size == 0
++        mlp_blocks, addend = (
++            ([*blocks, attn_out], None) if first else (blocks, attn_out)
++        )
++        norm = layer.mlp_norm
++        if messages is None:
++            mlp_in = mix(
++                mlp_blocks, queries.mlp_queries[i], norm.weight, norm.eps, addend
++            )
++        else:
++            mixed = mix(mlp_blocks, queries.mlp_queries[i], addend=addend)
++            mlp_in = controller(
++                layer, 3, mixed[0], messages[3], norm.weight[0], norm.eps
++            )[None]
++        mlp_out = _ref_conv(
++            layer.mlp(mlp_in[0], pass_idx=pass_idx), layer.mlp_sconv.weight
++        )
++        if first:
++            completed.append(partial)
++            partial = (attn_out.float() + mlp_out.float()).bfloat16()
++        else:
++            partial = (partial.float() + attn_out.float() + mlp_out.float()).bfloat16()
++    norm = model.norm
++    return mix([*completed, partial], queries.output_query, norm.weight, norm.eps)[0]
++
++
++def _compare_loop_reference(model: torch.nn.Module, kernel_ops: bool) -> None:
++    """Redraw the loop controllers, routers and AttnRes queries (dummy ones
++    leave every pass and mix alike), then record each forward's output with
++    the reference forward of the same inputs, run after it (AttnRes and
++    controllers by the model's kernels with `kernel_ops`; else in torch,
++    with the experts' down projections zeroed: their MXFP8 activation
++    quantization would amplify rounding-level differences). Per
++    forward, its token count, the output's max magnitude and the max over
++    tokens of the relative RMS error (plain floats: `apply_model` results
++    cross a process boundary)."""
++    generator = torch.Generator(device="cuda").manual_seed(0)
++    loop_model = model.model
++    for name, param in loop_model.named_parameters():
++        if "queries" in name or "query" in name:
++            std = 1.0 if "middle_cycle" in name else param.shape[-1] ** -0.5
++            param.data.normal_(std=std, generator=generator)
++    loop_model.process_weights_after_loading()
++    for layer in loop_model.layers:
++        # Fixed routing (a distinct bias per expert): rounding-level input
++        # differences must not flip a token's experts.
++        gate = layer.mlp.gate
++        gate.weight.zero_()
++        gate.bias.copy_(torch.linspace(1, 0, len(gate.bias)))
++        if not kernel_ops:
++            layer.mlp.experts.w2_weight.zero_()
++        if hasattr(layer, "controller_down"):
++            down, gain_forget = layer.controller_down, layer.controller_gain_forget
++            down.normal_(std=down.shape[-1] ** -0.5, generator=generator)
++            gain_forget.normal_(std=gain_forget.shape[-1] ** -0.5, generator=generator)
++    ops = (_kernel_mix, _kernel_controller) if kernel_ops else ()
++    results: list[tuple[float, ...]] = []
++    model.reference_results = results
++    forward = loop_model.forward
++
++    def compare(positions, inputs_embeds):
++        out = forward(positions, inputs_embeds)
++        with torch.no_grad():
++            ref = _ref_loop_forward(loop_model, positions, inputs_embeds, *ops)
++        diff = (out.float() - ref.float()).norm(dim=-1)
++        error = diff / ref.float().norm(dim=-1)
++        quantiles = error.quantile(error.new_tensor([0.5, 0.9])).tolist()
++        results.append(
++            (len(out), out.abs().amax().item(), error.max().item(), *quantiles)
++        )
++        return out
++
++    loop_model.forward = compare
++
++
++def _reference_results(model: torch.nn.Module):
++    return model.reference_results
++
++
++@pytest.mark.parametrize("kernel_ops", [True, False])
++def test_tiny_looped_model_matches_torch_reference(tmp_path, enable_pickle, kernel_ops):
++    """2 core layers x 2 passes (plus a prelude and a coda layer), random
++    weights: a prefill of the loop model matches a plain torch forward of
++    the same weights and inputs; with the model's AttnRes and controller
++    kernels in it, bit for bit."""
++    llm = LLM(
++        model=_write_model(tmp_path, TINY_LOOP_CONFIG),
++        load_format="dummy",
++        skip_tokenizer_init=True,
++        tokenizer_mode="hf",
++        gpu_memory_utilization=0.035,
++        max_model_len=2048,
++        max_num_seqs=1,
++        # One 200-token prefill.
++        max_num_batched_tokens=256,
++        enforce_eager=True,
++        enable_prefix_caching=False,
++        limit_mm_per_prompt={"image": 0},
++        hf_overrides={"text_config": {"loop_num_passes": 2}},
++    )
++    assert llm.llm_engine.model_config.hf_text_config.num_layer_visits == 6
++    llm.apply_model(partial(_compare_loop_reference, kernel_ops=kernel_ops))
++    prompt = list(range(2, 202))
++    llm.generate(
++        [{"prompt_token_ids": prompt}],
++        SamplingParams(max_tokens=1, ignore_eos=True, detokenize=False),
++    )
++    results = llm.apply_model(_reference_results)[0]
++    # One prefill forward of the prompt.
++    assert [r[0] for r in results] == [len(prompt)], results
++    _, magnitude, error, *_ = results[0]
++    assert magnitude > 0
++    # Per token, the relative RMS error of the final-norm output: 0 on the
++    # same kernels; else bf16 rounding of the mixes (<= 1e-3 measured on
++    # gfx1201 at 1-3 passes; a wrong pass, bank or
++    # controller is O(1)).
++    assert error <= (0.0 if kernel_ops else 5e-3), results
++
++
+ def _chunked_mixed_run(model: str, enforce_eager: bool) -> list[list[float]]:
+     llm = LLM(
+         model=model,
+diff --git a/tests/models/inkling2/test_moe.py b/tests/models/inkling2/test_moe.py
+index 49a1f9c51e..079f0fd989 100644
+--- a/tests/models/inkling2/test_moe.py
++++ b/tests/models/inkling2/test_moe.py
+@@ -12,7 +12,9 @@ from vllm.platforms import current_platform
+ if not (
+     current_platform.is_device_capability_family(100)
+     or current_platform.is_device_capability(90)
+-    or current_platform.is_device_capability_family(120)
++    or (
++        current_platform.is_cuda() and current_platform.is_device_capability_family(120)
++    )
+ ):
+     pytest.skip("Inkling2 MoE requires Hopper or Blackwell", allow_module_level=True)
+ 
+@@ -234,7 +236,13 @@ def test_shuffle_rows_matches_flashinfer():
+ 
+ 
+ requires_packed_experts = pytest.mark.skipif(
+-    not (use_sm100_kernels() or current_platform.is_device_capability_family(120)),
++    not (
++        use_sm100_kernels()
++        or (
++            current_platform.is_cuda()
++            and current_platform.is_device_capability_family(120)
++        )
++    ),
+     reason="Packed activation expert GEMMs (SM100 or SM12x)",
+ )
+ 
+@@ -592,7 +600,11 @@ def test_moe_layer_matches_reference(dist_init, fmt: str, tokens: int):
+ 
+ @pytest.mark.parametrize(
+     "tokens",
+-    [1, 8, 33, 1024] if current_platform.is_device_capability_family(120) else [],
++    [1, 8, 33, 1024]
++    if (
++        current_platform.is_cuda() and current_platform.is_device_capability_family(120)
++    )
++    else [],
+ )
+ def test_humming_nvfp4_preserves_quantized_experts(dist_init, tokens: int):
+     """Repacked W4A4 experts release checkpoint storage and preserve graph output."""
+diff --git a/tests/models/inkling2/test_moe_rocm.py b/tests/models/inkling2/test_moe_rocm.py
+index a975b238eb..feafc55c50 100644
+--- a/tests/models/inkling2/test_moe_rocm.py
++++ b/tests/models/inkling2/test_moe_rocm.py
+@@ -16,8 +16,16 @@ import torch
+ from vllm.platforms import current_platform
+ 
+ _is_rocm = current_platform.is_rocm()
+-if not (_is_rocm and current_platform.is_device_capability(95)):
+-    pytest.skip("the ROCm Inkling2 MoE tests require gfx950", allow_module_level=True)
++if not (
++    _is_rocm
++    and (
++        current_platform.is_device_capability(95)
++        or current_platform.is_device_capability_family(120)
++    )
++):
++    pytest.skip(
++        "the ROCm Inkling2 MoE tests require gfx950/gfx12", allow_module_level=True
++    )
+ 
+ from vllm.models.inkling2.nvidia.ops.block_scales import (  # noqa: E402
+     shuffle_rows,
+@@ -171,7 +179,7 @@ def _situ_reference_kernel(
+     X, Gammas, Y, N: tl.constexpr, GATE_CAP: tl.constexpr, UP_CAP: tl.constexpr
+ ):
+     row = tl.program_id(0)
+-    cols = tl.program_id(1) * 256 + tl.arange(0, 256)
++    cols = tl.program_id(1) * 128 + tl.arange(0, 128)
+     gate = tl.load(X + row * 2 * N + 2 * cols).to(tl.float32)
+     up = tl.load(X + row * 2 * N + 2 * cols + 1).to(tl.float32)
+     gate_cap = _tanh(tl.div_rn(gate, GATE_CAP))
+@@ -194,13 +202,15 @@ def _unswizzled_scales(scales: torch.Tensor, rows: torch.Tensor, tile: int):
+ 
+ @pytest.mark.parametrize("fmt", FORMATS)
+ @pytest.mark.parametrize("tile", [MIN_TILE, 128])
+-def test_situ_quantize_matches_separate_quantization(fmt: str, tile: int):
++# 1152: the expert width of Inkling-2-Mini (not a multiple of 256).
++@pytest.mark.parametrize("n", [2304, 1152])
++def test_situ_quantize_matches_separate_quantization(fmt: str, tile: int, n: int):
+     """The fused SiTU quantization equals quantizing the bf16 SiTU output:
+     bitwise values and scales, and for NVFP4 the row amax times the weight
+     scale as the down-projection row scale. MXFP8 covers both the per-column
+     block (few rows) and the whole-row programs."""
+     torch.manual_seed(0)
+-    n, num_rows, num_experts = 2304, 5 * tile, 4
++    num_rows, num_experts = 5 * tile, 4
+     x = (torch.randn(num_rows, 2 * n, device="cuda") * 4).bfloat16()
+     gammas = torch.rand(num_rows, device="cuda")
+     routed = torch.randperm(num_rows, device="cuda")[: num_rows - 5].int()
+@@ -226,7 +236,7 @@ def test_situ_quantize_matches_separate_quantization(fmt: str, tile: int):
+         )
+ 
+     y = torch.empty((num_rows, n), dtype=torch.bfloat16, device="cuda")
+-    _situ_reference_kernel[(num_rows, n // 256)](
++    _situ_reference_kernel[(num_rows, n // 128)](
+         x, gammas, y, n, 4.0, 25.0, enable_fp_fusion=False
+     )
+     rows = routed.long()
+@@ -244,6 +254,26 @@ def test_situ_quantize_matches_separate_quantization(fmt: str, tile: int):
+     )
+ 
+ 
++@pytest.mark.parametrize("hidden", [3072, 2304])
++@pytest.mark.parametrize("tokens", [1, 8, 37])
++def test_combine_sums_routed_rows(hidden: int, tokens: int):
++    """Each token sums its top-k rows in fp32, rows -1 count 0; 2304 is the
++    hidden size of Inkling-2-Mini (not a multiple of 512)."""
++    torch.manual_seed(0)
++    topk = 8
++    combine = import_module(f"{_PACKAGE}.ops.moe").combine
++    down = torch.randn(tokens * topk + 3, hidden, device="cuda")
++    src2dst = torch.randperm(tokens * topk + 3, device="cuda")[: tokens * topk].int()
++    src2dst[::5] = -1
++    out = combine(down, src2dst, topk, torch.bfloat16)
++    rows = src2dst.long().view(tokens, topk)
++    picked = torch.where(rows[..., None] >= 0, down[rows.clamp(min=0)], 0)
++    ref = torch.zeros(tokens, hidden, device="cuda")
++    for slot in range(topk):  # the kernel's fp32 summation order
++        ref += picked[:, slot]
++    torch.testing.assert_close(out.float(), ref.bfloat16().float(), atol=0, rtol=0)
++
++
+ @requires_nvfp4
+ def test_shuffle_rows_matches_flashinfer():
+     from flashinfer import shuffle_matrix_a
+@@ -254,7 +284,7 @@ def test_shuffle_rows_matches_flashinfer():
+ 
+ 
+ @pytest.mark.parametrize("fmt", FORMATS)
+-@pytest.mark.parametrize("tile", [16, 128, 256] if _is_rocm else [8, 128])
++@pytest.mark.parametrize("tile", [16, 32, 64, 128, 256] if _is_rocm else [8, 128])
+ def test_bmm_matches_dequantized_matmul(fmt: str, tile: int):
+     """Expert GEMM over tile-padded expert segments equals an fp64 matmul of
+     the dequantized operands, scaled per row (NVFP4) and rounded to bf16."""
+diff --git a/tests/models/inkling2/test_quant_rocm.py b/tests/models/inkling2/test_quant_rocm.py
+new file mode 100644
+index 0000000000..021abca460
+--- /dev/null
++++ b/tests/models/inkling2/test_quant_rocm.py
+@@ -0,0 +1,709 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Inkling2 quantization on ROCm (`amd/`): hf_quant_config.json parameter
++groups, NVFP4 / MXFP8 expert parameters and loaders (tensors kept as stored),
++the torch NVFP4 placeholder GEMM (`amd/ops/nvfp4_ref.py`) and the gfx12 NVFP4
++GEMM (`amd/ops/nvfp4_moe.py`).
++
++The released-checkpoint tests read Inkling-2-Mini from `INKLING2_MINI_PATH`
++(default `~/models/Inkling-2-Mini`) a tensor at a time and skip without it."""
++
++import json
++import os
++import re
++import struct
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from vllm.platforms import current_platform
++
++if not (
++    current_platform.is_rocm()
++    and (
++        current_platform.is_device_capability(95)
++        or current_platform.is_device_capability_family(120)
++    )
++):
++    pytest.skip(
++        "the ROCm Inkling2 quantization tests require gfx950/gfx12",
++        allow_module_level=True,
++    )
++
++from vllm.models.inkling2.amd import moe as moe_module  # noqa: E402
++from vllm.models.inkling2.amd.ops import nvfp4_moe, triton_bmm  # noqa: E402
++from vllm.models.inkling2.amd.ops.moe import route  # noqa: E402
++from vllm.models.inkling2.amd.ops.mxfp8 import mxfp8_quantize  # noqa: E402
++from vllm.models.inkling2.amd.ops.nvfp4_ref import (  # noqa: E402
++    dequant_nvfp4,
++    nvfp4_bmm_reference,
++)
++from vllm.models.inkling2.amd.quant_config import Inkling2QuantConfig  # noqa: E402
++from vllm.models.inkling2.nvidia.ops.block_scales import (  # noqa: E402
++    swizzle_block_scales,
++)
++
++CHECKPOINT = Path(
++    os.environ.get("INKLING2_MINI_PATH", "~/models/Inkling-2-Mini")
++).expanduser()
++MODEL_FILE = CHECKPOINT / "model-00001-of-00001.safetensors"
++MTP_FILE = CHECKPOINT / "mtp.safetensors"
++requires_checkpoint = pytest.mark.skipif(
++    not (MODEL_FILE.exists() and MTP_FILE.exists()),
++    reason=f"Inkling-2-Mini checkpoint not found at {CHECKPOINT}",
++)
++
++E2M1 = [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6]
++EXPERTS = "model.llm.layers.{}.mlp.experts.{}_weight"
++# safetensors dtype names -> torch.
++ST_DTYPES = {
++    "F32": torch.float32,
++    "BF16": torch.bfloat16,
++    "U8": torch.uint8,
++    "F8_E4M3": torch.float8_e4m3fn,
++}
++# Stored dtype of each compute dtype's tensor.
++STORED = {
++    "float32": torch.float32,
++    "bfloat16": torch.bfloat16,
++    "nvfp4": torch.uint8,
++    "mxfp8": torch.float8_e4m3fn,
++}
++
++MINI_MOE_CONFIG = SimpleNamespace(
++    hidden_size=2304,
++    intermediate_size=1152,
++    n_routed_experts=128,
++    n_shared_experts=0,
++    num_experts_per_tok=8,
++    route_scale=8.0,
++    mlp_gate_softcap=4.0,
++    mlp_up_softcap=25.0,
++    use_gate_bias=True,
++)
++MOE_CONFIG = SimpleNamespace(
++    **{**vars(MINI_MOE_CONFIG), "hidden_size": 512, "intermediate_size": 256}
++)
++MOE_CONFIG.n_routed_experts = 16
++
++
++def _header(path: Path) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
++    """Shape and dtype of every tensor of a safetensors file (header only)."""
++    with open(path, "rb") as f:
++        (size,) = struct.unpack("<Q", f.read(8))
++        header = json.loads(f.read(size))
++    header.pop("__metadata__", None)
++    return {k: (tuple(v["shape"]), ST_DTYPES[v["dtype"]]) for k, v in header.items()}
++
++
++def _group(compute: str, tensors: list[str], **extra) -> dict:
++    return {"compute_dtype": compute, "tensors": tensors, **extra}
++
++
++def _config(groups: list[dict], mtp: list[dict] | None = None) -> dict:
++    config: dict = {"quant_method": "inkling2", "model": {"parameter_groups": groups}}
++    if mtp is not None:
++        config["mtp"] = {"parameter_groups": mtp}
++    return config
++
++
++# --- parameter groups -------------------------------------------------------
++
++
++def test_expert_formats_per_layer():
++    config = Inkling2QuantConfig.from_config(
++        _config(
++            [
++                _group("float32", ["model.llm.attn_res.output_query"]),
++                _group("bfloat16", ["model.llm.embed.weight"]),
++                _group(
++                    "nvfp4",
++                    [EXPERTS.format(i, p) for i in range(2) for p in ("w13", "w2")],
++                ),
++                _group("mxfp8", [EXPERTS.format(2, "w13"), EXPERTS.format(2, "w2")]),
++                _group(
++                    "bfloat16",
++                    ["model.llm.unembed.weight"],
++                    fwd_output_dtype="float32",
++                ),
++            ],
++            mtp=[_group("bfloat16", ["fuse_weight"])],
++        )
++    )
++    assert config.get_name() == "inkling2"
++    assert config.expert_formats == {0: "nvfp4", 1: "nvfp4", 2: "mxfp8"}
++    assert [config.expert_format(i) for i in range(3)] == ["nvfp4"] * 2 + ["mxfp8"]
++    assert [config.is_nvfp4_layer(i) for i in range(4)] == [True, True, False, False]
++    assert [config.is_mxfp8_layer(i) for i in range(4)] == [False, False, True, False]
++    assert config.tensor_dtypes["model.llm.attn_res.output_query"] == "float32"
++    assert config.tensor_dtypes["model.llm.unembed.weight"] == "bfloat16"
++    assert config.fp32_output_tensors == {"model.llm.unembed.weight"}
++    assert config.mtp_tensor_dtypes == {"fuse_weight": "bfloat16"}
++    with pytest.raises(ValueError, match="no quantized experts for Inkling2 layer 3"):
++        config.expert_format(3)
++
++
++@pytest.mark.parametrize(
++    "groups, mtp, error",
++    [
++        (
++            [
++                _group("nvfp4", [EXPERTS.format(0, "w13")]),
++                _group("mxfp8", [EXPERTS.format(0, "w2")]),
++            ],
++            None,
++            "layer 0 mixes nvfp4 and mxfp8",
++        ),
++        (
++            [
++                _group("bfloat16", ["model.llm.embed.weight"]),
++                _group("float32", ["model.llm.embed.weight"]),
++            ],
++            None,
++            "in two parameter groups",
++        ),
++        (
++            [_group("nvfp4", ["model.llm.layers.0.attn.q_proj.weight"])],
++            None,
++            "routed experts only",
++        ),
++        (
++            [_group("bfloat16", [EXPERTS.format(0, "w13")])],
++            None,
++            "Unquantized Inkling2 experts",
++        ),
++        ([_group("int4", ["x"])], None, "Unsupported Inkling2 compute dtype"),
++        ([], [_group("mxfp8", ["fuse_weight"])], "mtp"),
++    ],
++)
++def test_invalid_parameter_groups(groups, mtp, error):
++    with pytest.raises(ValueError, match=error):
++        Inkling2QuantConfig.from_config(_config(groups, mtp))
++
++
++def test_min_capability_allows_gfx950_and_gfx12():
++    assert Inkling2QuantConfig.get_min_capability() <= 95
++    assert Inkling2QuantConfig.get_min_capability() <= 120
++
++
++@requires_checkpoint
++def test_released_mini_parameter_groups():
++    """Inkling-2-Mini: NVFP4 experts in layers 0-19, MXFP8 in 20-23, a fp32
++    output unembedding, all-BF16 DSpark."""
++    raw = json.loads((CHECKPOINT / "hf_quant_config.json").read_text())
++    config = Inkling2QuantConfig.from_config(raw)
++    assert config.expert_formats == {
++        i: ("nvfp4" if i < 20 else "mxfp8") for i in range(24)
++    }
++    counts: dict[str, int] = {}
++    for dtype in config.tensor_dtypes.values():
++        counts[dtype] = counts.get(dtype, 0) + 1
++    assert counts == {"float32": 74, "bfloat16": 994, "nvfp4": 40, "mxfp8": 8}
++    assert config.fp32_output_tensors == {"model.llm.unembed.weight"}
++    assert len(config.mtp_tensor_dtypes) == 54
++    assert set(config.mtp_tensor_dtypes.values()) == {"bfloat16"}
++
++
++# --- strict checkpoint coverage ---------------------------------------------
++
++
++def _expert_params(fmt: str) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
++    with torch.device("meta"):
++        experts = moe_module.Inkling2Experts(MINI_MOE_CONFIG, fmt)
++    return {n: (tuple(p.shape), p.dtype) for n, p in experts.named_parameters()}
++
++
++@requires_checkpoint
++def test_checkpoint_tensors_match_quant_config_and_experts(dist_init):
++    """Every tensor of `model-00001-of-00001.safetensors` and
++    `mtp.safetensors` is accounted for with its stored shape and dtype:
++    expert tensors are exactly the parameters of the layer format's
++    `Inkling2Experts` (both ways), every other tensor is listed in the
++    quant config with a matching stored dtype."""
++    config = Inkling2QuantConfig.from_config(
++        json.loads((CHECKPOINT / "hf_quant_config.json").read_text())
++    )
++    expected = {fmt: _expert_params(fmt) for fmt in ("nvfp4", "mxfp8")}
++    expert_re = re.compile(r"^model\.llm\.layers\.(\d+)\.mlp\.experts\.(.+)$")
++    seen_experts: dict[int, set[str]] = {}
++    unlisted = []
++    for name, (shape, dtype) in _header(MODEL_FILE).items():
++        if name.startswith("model.visual."):
++            # Vision tensors are BF16 casts like the rest of the model.
++            assert dtype == torch.bfloat16, name
++            assert config.tensor_dtypes.get(name, "bfloat16") == "bfloat16", name
++            continue
++        m = expert_re.match(name)
++        if m is not None:
++            layer, param = int(m.group(1)), m.group(2)
++            fmt = config.expert_format(layer)
++            assert param in expected[fmt], f"{name}: not an {fmt} expert tensor"
++            assert expected[fmt][param] == (shape, dtype), name
++            seen_experts.setdefault(layer, set()).add(param)
++            if param.endswith("_weight"):
++                assert config.tensor_dtypes[name] == fmt
++            continue
++        compute = config.tensor_dtypes.get(name)
++        if compute is None:
++            unlisted.append(name)
++            continue
++        assert STORED[compute] == dtype, f"{name}: {compute} stored as {dtype}"
++    assert unlisted == []
++    assert seen_experts == {
++        layer: set(expected[config.expert_format(layer)]) for layer in range(24)
++    }
++    mtp = _header(MTP_FILE)
++    assert mtp.keys() == config.mtp_tensor_dtypes.keys()
++    assert {dtype for _, dtype in mtp.values()} == {torch.bfloat16}
++    # Every listed model tensor exists in the checkpoint.
++    model = _header(MODEL_FILE)
++    assert config.tensor_dtypes.keys() <= model.keys()
++
++
++@requires_checkpoint
++@pytest.mark.parametrize("layer", [0, 19, 20, 23])
++def test_expert_loaders_keep_tensors_as_stored(dist_init, layer: int):
++    """The experts' loaders copy each real checkpoint tensor bit for bit
++    (no row shuffle, no scale swizzle), one tensor at a time."""
++    from safetensors import safe_open
++
++    config = Inkling2QuantConfig.from_config(
++        json.loads((CHECKPOINT / "hf_quant_config.json").read_text())
++    )
++    fmt = config.expert_format(layer)
++    with torch.device("cpu"):
++        experts = moe_module.Inkling2Experts(MINI_MOE_CONFIG, fmt)
++    prefix = f"model.llm.layers.{layer}.mlp.experts."
++    with safe_open(MODEL_FILE, framework="pt") as f:
++        names = [n for n in f.keys() if n.startswith(prefix)]  # noqa: SIM118
++        params = dict(experts.named_parameters())
++        assert sorted(n.removeprefix(prefix) for n in names) == sorted(params)
++        for name in names:
++            loaded = f.get_slice(name)[:]
++            param = params[name.removeprefix(prefix)]
++            param.weight_loader(param, loaded)
++            assert torch.equal(param.data.view(torch.uint8), loaded.view(torch.uint8))
++            del loaded
++    if fmt == "nvfp4":
++        assert torch.all(experts.w13_weight_outer_scale_denominator == 2688.0)
++        # The outer scale makes each expert's largest weight its amax (C2).
++        for e in (0, 77):
++            w = dequant_nvfp4(experts.w13_weight[e], experts.w13_weight_scale[e])
++            scale = (
++                experts.w13_weight_amax[e] / experts.w13_weight_outer_scale_denominator
++            )
++            torch.testing.assert_close(
++                (w * scale).abs().max(), experts.w13_weight_amax[e], rtol=1e-6, atol=0
++            )
++
++
++# --- NVFP4 placeholder GEMM -------------------------------------------------
++
++
++def _random_nvfp4(*shape: int, device="cuda") -> tuple[torch.Tensor, torch.Tensor]:
++    values = torch.randint(0, 256, (*shape[:-1], shape[-1] // 2), device=device)
++    scales = torch.rand(*shape[:-1], shape[-1] // 16, device=device) + 0.5
++    return values.to(torch.uint8), scales.to(torch.float8_e4m3fn)
++
++
++def _random_mxfp8(*shape: int, std: float = 1.0) -> tuple[torch.Tensor, torch.Tensor]:
++    values = (torch.randn(shape, device="cuda") * std).to(torch.float8_e4m3fn)
++    scales = torch.randint(120, 128, (*shape[:-1], shape[-1] // 32), device="cuda")
++    return values, scales.to(torch.uint8)
++
++
++def _dequant_mxfp8(values: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
++    return values.double() * torch.exp2(scales.double() - 127).repeat_interleave(32, -1)
++
++
++def _oracle_nvfp4(values, scales, amax, denominator) -> torch.Tensor:
++    """float64 bit-level decode (FACTS §4 (a), (c)), independent of the LUT."""
++    codes = torch.stack((values & 0xF, values >> 4), -1).flatten(-2).long()
++    sign = 1.0 - 2.0 * (codes >> 3).double()
++    exp, man = (codes >> 1) & 3, (codes & 1).double()
++    mag = torch.where(exp == 0, 0.5 * man, torch.exp2(exp.double() - 1) * (1 + man / 2))
++    block = scales.double().repeat_interleave(16, -1)
++    return sign * mag * block * (amax.double() / denominator.double())[..., None, None]
++
++
++def test_dequant_nvfp4_is_exact():
++    torch.manual_seed(0)
++    values, scales = _random_nvfp4(3, 64, 256)
++    amax = torch.rand(3, device="cuda") + 0.1
++    denominator = torch.tensor([2688.0], device="cuda")
++    # The block decode is exact in fp32; the outer scale is fp32 like NVIDIA's.
++    one = torch.ones(1, device="cuda")
++    raw = dequant_nvfp4(values, scales)
++    assert torch.equal(raw.double(), _oracle_nvfp4(values, scales, one.expand(3), one))
++    outer = (amax / denominator).double()
++    ref = _oracle_nvfp4(values, scales, outer.float(), one)
++    out = raw.double() * outer[:, None, None]
++    assert torch.equal(out, ref)
++    codes = torch.arange(16, dtype=torch.uint8, device="cuda")
++    one = torch.ones(1, 1, dtype=torch.float8_e4m3fn, device="cuda").expand(16, 1)
++    low = dequant_nvfp4((codes | 0x00)[:, None].expand(16, 8).contiguous(), one)
++    assert low[:, 0].tolist() == E2M1 and low[:, 1].tolist() == [0.0] * 16
++
++
++def _tiles(counts: list[int], tile: int, plan) -> tuple[torch.Tensor, list]:
++    experts, limits, rows, start = [], [], [], 0
++    for expert, count in enumerate(counts):
++        for t in range(-(-count // tile)):
++            experts.append(expert)
++            limits.append(min(start + (t + 1) * tile, start + count))
++        rows += [(start + i, expert) for i in range(count)]
++        start += -(-count // tile) * tile
++    pad = [0] * (plan.max_ctas - len(experts))
++    tiles = torch.tensor(
++        experts + pad + limits + pad + [len(experts), start],
++        dtype=torch.int32,
++        device="cuda",
++    )
++    return tiles, rows
++
++
++def _r8c4(scales: torch.Tensor) -> torch.Tensor:
++    rows, cols = scales.shape
++    tiles = scales.reshape(rows // 8, 8, cols // 4, 4).permute(0, 2, 1, 3)
++    return tiles.reshape(scales.shape).contiguous()
++
++
++@pytest.mark.parametrize("tile", [16, 128, 256])
++def test_nvfp4_bmm_reference_matches_fp64(tile: int):
++    """Placeholder GEMM over tile-padded expert segments (one empty expert,
++    one spanning tiles) equals an fp64 matmul of the dequantized operands
++    with the outer scale, rounded to bf16; padding rows stay 0."""
++    torch.manual_seed(0)
++    counts, n, k = [3, 0, 17, 1], 256, 1024
++    plan = triton_bmm.expert_plan(sum(counts), 1, len(counts), tile)
++    weight, weight_scale = _random_nvfp4(len(counts), n, k)
++    amax = torch.rand(len(counts), device="cuda") * 100 + 100
++    denominator = torch.tensor([2688.0], device="cuda")
++    act, act_scale = _random_mxfp8(plan.rows, k)
++    tiles, rows = _tiles(counts, tile, plan)
++    swizzle = swizzle_block_scales if tile >= 128 else _r8c4
++    out = nvfp4_bmm_reference(
++        act, swizzle(act_scale), weight, weight_scale, amax, denominator, tiles, plan
++    )
++    index = torch.tensor([r for r, _ in rows], device="cuda")
++    expert = torch.tensor([e for _, e in rows], device="cuda")
++    a = _dequant_mxfp8(act, act_scale)[index]
++    w = _oracle_nvfp4(weight, weight_scale, amax, denominator)[expert]
++    ref = torch.einsum("rk,rnk->rn", a, w).bfloat16().float()
++    torch.testing.assert_close(
++        out[index].float(), ref, atol=1e-3 * ref.abs().max().item(), rtol=1e-2
++    )
++    padding = torch.ones(plan.rows, dtype=torch.bool, device="cuda")
++    padding[index] = False
++    assert torch.all(out[padding] == 0)
++
++
++# --- NVFP4 GEMM (gfx12 kernel) ----------------------------------------------
++
++
++def _bmm_case(counts, n, k, tile, weight, weight_scale, amax, seed=0, act_std=1.0):
++    torch.manual_seed(seed)
++    plan = triton_bmm.expert_plan(sum(counts), 1, len(counts), tile)
++    act, act_scale = _random_mxfp8(plan.rows, k, std=act_std)
++    tiles, rows = _tiles(counts, tile, plan)
++    swizzle = swizzle_block_scales if tile >= 128 else _r8c4
++    denominator = torch.tensor([2688.0], device="cuda")
++    args = (act, swizzle(act_scale), weight, weight_scale, amax, denominator, tiles)
++    index = torch.tensor([r for r, _ in rows], device="cuda")
++    expert = torch.tensor([e for _, e in rows], device="cuda")
++    return plan, args, index, expert, _dequant_mxfp8(act, act_scale)
++
++
++def _run_kernel(kernel: str, args, plan) -> torch.Tensor:
++    """`bmm` as dispatched ("auto"), its WMMA kernel or the decode GEMV."""
++    if kernel == "gemv":
++        return nvfp4_moe.gemv(*args, plan)
++    if kernel == "wmma":
++        n, k_half = args[2].shape[1:]
++        config = nvfp4_moe.bmm_config(plan.tile, n, 2 * k_half)
++        return nvfp4_moe.bmm(*args, plan, config)
++    return nvfp4_moe.bmm(*args, plan)
++
++
++def _check_bmm(plan, args, index, expert, a64, label, kernel="auto"):
++    """Kernel vs. the placeholder GEMM and an fp64 oracle (both rounded to
++    bf16) on the routed rows; returns and prints the errors."""
++    out = _run_kernel(kernel, args, plan)[index].float()
++    ref = nvfp4_bmm_reference(*args, plan)[index].float()
++    act, _, weight, weight_scale, amax, denominator, _ = args
++    w = _oracle_nvfp4(weight, weight_scale, amax, denominator)
++    exact = torch.stack(
++        [a64[r] @ w[e].T for r, e in zip(index.tolist(), expert.tolist())]
++    )
++    oracle = exact.bfloat16().float()
++    top = exact.abs().max().item()
++    errors = {
++        "vs_ref_abs": (out - ref).abs().max().item(),
++        "vs_ref_rel": (out - ref).abs().max().item() / top,
++        "vs_fp64_abs": (out.double() - exact).abs().max().item(),
++        "vs_fp64_rel": (out.double() - exact).abs().max().item() / top,
++    }
++    print(label, {k: f"{v:.2e}" for k, v in errors.items()})
++    # fp32 accumulation, then one bf16 rounding: at most a bf16 ulp or two of
++    # the largest output away from the bf16-rounded fp64 result.
++    torch.testing.assert_close(out, oracle, atol=1e-2 * top, rtol=1e-2)
++    torch.testing.assert_close(out, ref, atol=1e-2 * top, rtol=1e-2)
++    assert errors["vs_fp64_rel"] < 1e-2
++    return errors
++
++
++@pytest.mark.parametrize("tile", [16, 32, 64, 128, 256])
++def test_nvfp4_bmm_matches_reference_and_fp64(tile: int):
++    """gfx12 NVFP4 GEMM over tile-padded expert segments (an empty expert,
++    one spanning tiles), both act scale layouts (R8c4 below 128-row tiles)."""
++    torch.manual_seed(0)
++    counts, n, k = [3, 0, 17, 1, 300], 256, 1024
++    weight, weight_scale = _random_nvfp4(len(counts), n, k)
++    amax = torch.rand(len(counts), device="cuda") * 100 + 100
++    case = _bmm_case(counts, n, k, tile, weight, weight_scale, amax)
++    _check_bmm(*case, f"tile={tile}", kernel="wmma")
++    if tile == 16:
++        _check_bmm(*case, f"tile={tile} gemv", kernel="gemv")
++
++
++def test_nvfp4_bmm_runs_gemv_for_decode_plans(monkeypatch):
++    """Plans of 16-row tiles up to `GEMV_MAX_CTAS` tiles go to `gemv`."""
++    calls = []
++    real = nvfp4_moe.gemv
++    monkeypatch.setattr(
++        nvfp4_moe, "gemv", lambda *a, **kw: calls.append(1) or real(*a, **kw)
++    )
++    n, k = 64, 256
++    weight, weight_scale = _random_nvfp4(128, n, k)
++    amax = torch.ones(128, device="cuda")
++    denominator = torch.ones(1, device="cuda")
++    for tokens, gemv in ((1, True), (2, True), (4, False), (512, False)):
++        plan = triton_bmm.expert_plan(tokens, 8, 128)
++        act, act_scale = _random_mxfp8(plan.rows, k)
++        tiles, _ = _tiles([1] * 8, plan.tile, plan)
++        calls.clear()
++        nvfp4_moe.bmm(
++            act, act_scale, weight, weight_scale, amax, denominator, tiles, plan
++        )
++        assert bool(calls) == gemv, (tokens, plan)
++
++
++@pytest.mark.parametrize("k", [1152, 2304])
++@pytest.mark.parametrize("tiny", [False, True])
++def test_nvfp4_gemv_matches_fp64(k: int, tiny: bool):
++    """Decode GEMV at Mini's K (a partial last unrolled step at 1152), one to
++    a few rows per expert. `tiny`: e4m3 subnormal block scales (decoded
++    weights down to the fp16 subnormal 2^-24) and e4m3 subnormal
++    activations, so flushed fp16 / fp32 denormals would show."""
++    torch.manual_seed(0)
++    counts, n = [1, 0, 2, 1, 3, 16, 1], 256
++    weight, weight_scale = _random_nvfp4(len(counts), n, k)
++    if tiny:
++        weight_scale = torch.randint(1, 8, weight_scale.shape, device="cuda")
++        weight_scale = weight_scale.to(torch.uint8).view(torch.float8_e4m3fn)
++    amax = torch.rand(len(counts), device="cuda") + 0.5
++    act_std = 2.0**-7 if tiny else 1.0
++    case = _bmm_case(counts, n, k, 16, weight, weight_scale, amax, act_std=act_std)
++    if tiny:
++        assert (case[1][0].view(torch.uint8) & 0x78 == 0).float().mean() > 0.3
++    _check_bmm(*case, f"gemv k={k} tiny={tiny}", kernel="gemv")
++
++
++@requires_checkpoint
++@pytest.mark.parametrize("layer", [0, 19])
++@pytest.mark.parametrize("name", ["w13", "w2"])
++@pytest.mark.parametrize("tile", [16, 128])
++def test_nvfp4_bmm_real_weights(layer: int, name: str, tile: int):
++    """Mini's own NVFP4 experts (hidden 2304, expert width 1152): 4 experts
++    of the layer's w13 / w2 at decode and prefill tiles."""
++    from safetensors import safe_open
++
++    prefix = f"model.llm.layers.{layer}.mlp.experts.{name}_weight"
++    picked = [0, 5, 77, 127]
++    with safe_open(MODEL_FILE, framework="pt") as f:
++        weight = f.get_slice(prefix)[:][picked].cuda()
++        weight_scale = f.get_slice(f"{prefix}_scale")[:][picked].cuda()
++        amax = f.get_slice(f"{prefix}_amax")[:][picked].cuda()
++    n, k = weight.shape[1], 2 * weight.shape[2]
++    assert (n, k) == ((2304, 2304) if name == "w13" else (2304, 1152))
++    counts = [1, 0, 9, 40] if tile == 16 else [130, 2, 0, 300]
++    case = _bmm_case(counts, n, k, tile, weight, weight_scale, amax)
++    _check_bmm(*case, f"L{layer} {name} tile={tile}", kernel="wmma")
++    if tile == 16:
++        _check_bmm(*case, f"L{layer} {name} gemv", kernel="gemv")
++        # Decode routing: a row or two per expert.
++        case = _bmm_case([1, 2, 1, 1], n, k, tile, weight, weight_scale, amax, 1)
++        _check_bmm(*case, f"L{layer} {name} gemv decode", kernel="gemv")
++
++
++@pytest.mark.parametrize("kernel", ["wmma", "gemv"])
++def test_nvfp4_bmm_graph_capture(kernel: str):
++    """The GEMM captures in a (HIP) graph and replays on new routing and
++    activations with the same result as eager calls."""
++    torch.manual_seed(0)
++    n, k, tile = 256, 512, 16
++    weight, weight_scale = _random_nvfp4(4, n, k)
++    amax = torch.rand(4, device="cuda") + 1
++    plan, args, *_ = _bmm_case([2, 5, 0, 1], n, k, tile, weight, weight_scale, amax)
++    static = [a.clone() for a in args]
++    _run_kernel(kernel, static, plan)
++    torch.cuda.synchronize()
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        out = _run_kernel(kernel, static, plan)
++    for counts, seed in (([2, 5, 0, 1], 1), ([0, 1, 7, 0], 2)):
++        _, new, index, *_ = _bmm_case(
++            counts, n, k, tile, weight, weight_scale, amax, seed
++        )
++        for dst, src in zip(static, new):
++            dst.copy_(src)
++        graph.replay()
++        torch.cuda.synchronize()
++        assert torch.equal(out[index], _run_kernel(kernel, new, plan)[index])
++
++
++# --- NVFP4 MoE layer --------------------------------------------------------
++
++
++def _random_moe_weights(fmt: str) -> dict[str, torch.Tensor]:
++    torch.manual_seed(0)
++    weights = {
++        "gate.weight": (torch.randn(16, 512, device="cuda") * 0.05).bfloat16(),
++        "gate.bias": torch.randn(16, device="cuda") * 0.01,
++    }
++    for name, n, k in (("w13", 512, 512), ("w2", 512, 256)):
++        prefix = f"experts.{name}_weight"
++        if fmt == "nvfp4":
++            weights[prefix], weights[f"{prefix}_scale"] = _random_nvfp4(16, n, k)
++            weights[f"{prefix}_amax"] = torch.rand(16, device="cuda") * 100 + 100
++            weights[f"{prefix}_outer_scale_denominator"] = torch.tensor(
++                [2688.0], device="cuda"
++            )
++        else:
++            weights[prefix], weights[f"{prefix}_scale"] = _random_mxfp8(16, n, k)
++    return weights
++
++
++def _moe_reference(moe, x: torch.Tensor, cfg) -> torch.Tensor:
++    """Per-token loop over the selected experts' fp64-dequantized weights,
++    MXFP8 activations (as the ROCm layer quantizes them)."""
++    from vllm.models.inkling2.amd.ops.linear import linear_k_groups
++
++    logits = linear_k_groups(x, moe.gate.weight).float()
++    keys = torch.sigmoid(logits) + moe.gate.bias
++    ids = keys.topk(cfg.num_experts_per_tok, -1, sorted=False).indices
++    selected = torch.sigmoid(logits.gather(1, ids))
++    weights = selected / selected.sum(-1, keepdim=True) * cfg.route_scale
++    exp = moe.experts
++
++    def linear(a, name, e):
++        av, as_ = mxfp8_quantize(a)
++        w = getattr(exp, f"{name}_weight")[e]
++        s = getattr(exp, f"{name}_weight_scale")[e]
++        if exp.nvfp4:
++            amax = getattr(exp, f"{name}_weight_amax")[e : e + 1]
++            den = getattr(exp, f"{name}_weight_outer_scale_denominator")
++            wd = _oracle_nvfp4(w[None], s[None], amax, den)[0]
++        else:
++            wd = _dequant_mxfp8(w, s)
++        return (_dequant_mxfp8(av, as_) @ wd.T).bfloat16()
++
++    out = torch.zeros(x.shape, dtype=torch.float64, device=x.device)
++    for t in range(x.shape[0]):
++        for slot in range(ids.shape[1]):
++            e = ids[t, slot].item()
++            gate_up = linear(x[t : t + 1], "w13", e).double()
++            gate, up = gate_up[:, 0::2], gate_up[:, 1::2]
++            act = (
++                cfg.mlp_gate_softcap
++                * torch.tanh(gate / cfg.mlp_gate_softcap)
++                * torch.sigmoid(gate)
++                * cfg.mlp_up_softcap
++                * torch.tanh(up / cfg.mlp_up_softcap)
++                * weights[t, slot].double()
++            )
++            out[t] += linear(act.bfloat16(), "w2", e)[0].double()
++    return out.bfloat16()
++
++
++def _build_moe(fmt: str, weights: dict[str, torch.Tensor]):
++    with torch.device("cuda"):
++        moe = moe_module.Inkling2MoE(MOE_CONFIG, fmt)
++    params = dict(moe.named_parameters())
++    assert params.keys() == weights.keys()
++    for name, param in params.items():
++        param.weight_loader(param, weights[name])
++    return moe
++
++
++@pytest.mark.parametrize("fmt", ["nvfp4", "mxfp8"])
++def test_expert_parameters_per_format(dist_init, fmt: str):
++    """Checkpoint shapes and dtypes of Mini's expert tensors per format."""
++    params = _expert_params(fmt)
++    if fmt == "nvfp4":
++        assert params == {
++            "w13_weight": ((128, 2304, 1152), torch.uint8),
++            "w13_weight_scale": ((128, 2304, 144), torch.float8_e4m3fn),
++            "w13_weight_amax": ((128,), torch.float32),
++            "w13_weight_outer_scale_denominator": ((1,), torch.float32),
++            "w2_weight": ((128, 2304, 576), torch.uint8),
++            "w2_weight_scale": ((128, 2304, 72), torch.float8_e4m3fn),
++            "w2_weight_amax": ((128,), torch.float32),
++            "w2_weight_outer_scale_denominator": ((1,), torch.float32),
++        }
++    else:
++        assert params == {
++            "w13_weight": ((128, 2304, 2304), torch.float8_e4m3fn),
++            "w13_weight_scale": ((128, 2304, 72), torch.uint8),
++            "w2_weight": ((128, 2304, 1152), torch.float8_e4m3fn),
++            "w2_weight_scale": ((128, 2304, 36), torch.uint8),
++        }
++    with pytest.raises(ValueError, match="Unsupported Inkling2 expert format"):
++        moe_module.Inkling2Experts(MINI_MOE_CONFIG, "bf16")
++
++
++@pytest.mark.parametrize("tokens", [5, 33, 200])
++def test_nvfp4_moe_layer_matches_reference(dist_init, tokens: int):
++    """Full NVFP4 layer (TP=1, gfx12 GEMM) vs. a per-token loop over
++    fp64-dequantized experts, fused (few tokens) and separate routing."""
++    moe = _build_moe("nvfp4", _random_moe_weights("nvfp4"))
++    x = torch.randn(tokens, 512, device="cuda").bfloat16()
++    out = moe(x)
++    ref = _moe_reference(moe, x, MOE_CONFIG)
++    scale = ref.abs().max().item()
++    assert scale > 0.1
++    torch.testing.assert_close(out, ref, atol=1e-2 * scale, rtol=2e-2)
++
++
++def test_route_layout_matches_nvfp4_gemm_rows(dist_init):
++    """The NVFP4 GEMM reads exactly the rows `route` fills: zeroing the
++    unrouted rows of its input changes nothing."""
++    moe = _build_moe("nvfp4", _random_moe_weights("nvfp4"))
++    x = torch.randn(9, 512, device="cuda").bfloat16()
++    exp = moe.experts
++    plan = exp.plan(x.shape[0])
++    routing, (act, act_scale) = route(
++        x,
++        moe.gate.weight,
++        moe.gate.bias,
++        moe.gate.counters,
++        exp.counts,
++        moe.gate.topk,
++        moe.gate.route_scale,
++        exp.expert_bounds,
++        plan,
++        None,
++    )
++    tiles = routing[3]
++    out = exp._gemm((act, act_scale), "w13", tiles, plan)
++    host = tiles.tolist()
++    used = torch.zeros(plan.rows, dtype=torch.bool, device="cuda")
++    for t in range(host[2 * plan.max_ctas]):
++        used[t * plan.tile : host[plan.max_ctas + t]] = True
++    masked = act.clone()
++    masked.view(torch.uint8)[~used] = 0
++    again = exp._gemm((masked, act_scale), "w13", tiles, plan)
++    assert torch.equal(out[used], again[used])
++    assert used.sum().item() == x.shape[0] * moe.gate.topk
+diff --git a/tests/models/inkling2/test_vision.py b/tests/models/inkling2/test_vision.py
+index 62eab808a8..4b74adc933 100644
+--- a/tests/models/inkling2/test_vision.py
++++ b/tests/models/inkling2/test_vision.py
+@@ -23,10 +23,19 @@ pytestmark = pytest.mark.skipif(
+     not (
+         current_platform.is_device_capability(90)
+         or current_platform.is_device_capability_family(100)
+-        or current_platform.is_device_capability_family(120)
+-        or (current_platform.is_rocm() and current_platform.is_device_capability(95))
++        or (
++            current_platform.is_cuda()
++            and current_platform.is_device_capability_family(120)
++        )
++        or (
++            current_platform.is_rocm()
++            and (
++                current_platform.is_device_capability(95)
++                or current_platform.is_device_capability_family(120)
++            )
++        )
+     ),
+-    reason="needs a Hopper or Blackwell GPU, or gfx950",
++    reason="needs a Hopper or Blackwell GPU, or gfx950/gfx12",
+ )
+ 
+ CONFIG = {

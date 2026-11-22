@@ -1,0 +1,17 @@
+redshift patch: core/0102-config-gfx12-bringup.patch
+cut from: b6faecc59a..93edd85693 -- vllm/config/vllm.py
+commits:
+  85101d9f9d Abhinand B: [A] Inkling2 ROCm: enable gfx12x bring-up, keep SM12x checks CUDA-only
+
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index 4ea6278f6c..b781dc3e33 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -1568,6 +1568,7 @@ class VllmConfig:
+         if (
+             cache_dtype == "float16"
+             and model_dtype == "bfloat16"
++            and current_platform.is_cuda()
+             and current_platform.is_device_capability_family(120)
+             and getattr(self.model_config, "architecture", None)
+             in (

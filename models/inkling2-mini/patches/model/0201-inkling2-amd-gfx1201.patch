@@ -1,0 +1,4617 @@
+redshift patch: model/0201-inkling2-amd-gfx1201.patch
+cut from: b6faecc59a..93edd85693 -- vllm/models
+commits:
+  85101d9f9d Abhinand B: [A] Inkling2 ROCm: enable gfx12x bring-up, keep SM12x checks CUDA-only
+  475655757d Abhinand B: [A] Inkling2 ROCm attention: KV cache layer config API (#61452)
+  cc582f55e6 Abhinand B: [F] Inkling2 ROCm: support Inkling-2-Mini widths in MoE combine and SwiGLU quantize
+  5b4ffe131e Abhinand B: [C] Inkling2 ROCm: loop core (amd/loop.py, ops/loop.py), pass caches, fp32 attn_res
+  95e89bae46 Abhinand B: [C] Inkling2 ROCm: parse NVFP4/MXFP8 expert groups, load NVFP4 experts as stored
+  c49651debf Abhinand B: [F] Inkling2 ROCm: support Inkling-2-Mini widths in MoE combine and SwiGLU quantize
+  b73bd92396 Abhinand B: [B] Inkling2 ROCm MXFP8 BMM: gfx12 config table + fp8 WMMA kernel
+  e4d2f3aa5b Abhinand B: [F] Inkling2 ROCm attention: per-arch split-KV decode config, gfx12 tuning
+  8cf06c29ae Abhinand B: [F] Inkling2 ROCm MoE: plain launch of the fused routing kernel on gfx12
+  778ed934bc Abhinand B: [F] Inkling2 ROCm: fused_add_rms_norm in one Triton launch
+  7adfc55669 Abhinand B: [A] Inkling2 ROCm: build each layer's experts in its checkpoint format (NVFP4 or MXFP8)
+  b5110ac586 Abhinand B: [C] Inkling2 ROCm DSpark: Triton draft KV write, in-place refold
+  8a3404551f Abhinand B: [B] Inkling2 ROCm: gfx12 Triton NVFP4 expert GEMM replacing the torch placeholder
+  ed7a9b645b Abhinand B: [F] Inkling2 ROCm: one-row Triton GEMV for batch-1 decode linears
+  e348045c11 Abhinand B: [F] Inkling2 ROCm: unit-scale FP8 (E4M3) KV cache
+  b6eb181a6a Abhinand B: [K] Inkling2 ROCm DSpark: speculator_options draft_context caps the draft's global layer
+  79429ec86e Abhinand B: [B] WIP: NVFP4 decode GEMV kernel (v_dot2, no WMMA) written, untested; baseline re-measured
+  fee7278875 Abhinand B: [S] WIP: gemv_rows kernel (untuned, unwired), adaptive-verification glue (untested), S1 scripts + resume note
+  c6af9322d9 Abhinand B: [P] Inkling2 ROCm: gfx12 prefill attention kernel
+  ffcd7aed1b Abhinand B: [S] Inkling2 ROCm: 2-16 row Triton GEMV for spec-decode verify linears
+  92fd93a785 Abhinand B: [B] Inkling2 ROCm: NVFP4 decode GEMV (v_dot2, no WMMA) for plans of <= 64 tiles
+  d2632a0c6c Abhinand B: [S] Inkling2 ROCm: adaptive DSpark verification
+  d896b395af Abhinand B: [K] Inkling2 ROCm: tail-only conv-state cache manager
+  e926e520f2 Abhinand B: [K] Inkling2 ROCm DSpark: optional unit-scale FP8 draft KV cache
+  50f5d68b80 Abhinand B: [F] Inkling2 ROCm: one-launch segment GEMV for a batch-1 layer's projections
+  3a5cd3deb8 Abhinand B: [F] Inkling2 ROCm: loop pass messages in one launch, pair RMSNorm in the controller GEMV
+  f49c49681e Abhinand B: [F] Inkling2 ROCm: fused short conv + AttnRes mix for small batches
+  0db1b8ab9a Abhinand B: [B] Inkling2 ROCm NVFP4: run the decode GEMV only up to 2 tokens
+
+diff --git a/vllm/models/inkling/amd/sconv_swa_attn.py b/vllm/models/inkling/amd/sconv_swa_attn.py
+index d0212731bf..140f12039f 100644
+--- a/vllm/models/inkling/amd/sconv_swa_attn.py
++++ b/vllm/models/inkling/amd/sconv_swa_attn.py
+@@ -31,9 +31,10 @@ from vllm.v1.attention.backend import (
+     AttentionMetadata,
+     AttentionMetadataBuilder,
+     CommonAttentionMetadata,
++    max_decode_query_len,
+ )
+ from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
+-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayerConfig
++from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayerConfig, KVCacheSpec
+ 
+ from .ops.sconv import sconv_seq_metadata
+ 
+@@ -52,6 +53,16 @@ class InklingSconvMetadata(AttentionMetadata):
+ class InklingSconvMetadataBuilder(AttentionMetadataBuilder[InklingSconvMetadata]):
+     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+ 
++    @classmethod
++    def get_varlen_cudagraph_max_query_len(
++        cls, vllm_config: VllmConfig, kv_cache_spec: KVCacheSpec
++    ) -> int | None:
++        # `build` derives every per-token row from the device
++        # `query_start_loc` (after adaptive verification trims it), so a
++        # decode graph replays requests of 1..L query tokens.
++        del kv_cache_spec
++        return max_decode_query_len(vllm_config)
++
+     def __init__(
+         self,
+         kv_cache_spec: AttentionSpec,
+diff --git a/vllm/models/inkling2/amd/attention.py b/vllm/models/inkling2/amd/attention.py
+index 4ead1731ee..7ffc879ffd 100644
+--- a/vllm/models/inkling2/amd/attention.py
++++ b/vllm/models/inkling2/amd/attention.py
+@@ -22,18 +22,21 @@ from vllm.model_executor.layers.linear import (
+ )
+ from vllm.model_executor.utils import set_weight_attrs
+ from vllm.models.inkling.amd.sconv_swa_attn import InklingConvState
+-from vllm.utils.torch_utils import canonicalize_singleton_dim_strides
+-from vllm.v1.attention.backend import AttentionBackend
++from vllm.utils.torch_utils import (
++    canonicalize_singleton_dim_strides,
++    kv_cache_dtype_str_to_dtype,
++)
++from vllm.v1.attention.backend import AttentionBackend, max_decode_query_len
+ from vllm.v1.attention.backends.flash_attn import (
+     FlashAttentionBackend,
+     FlashAttentionMetadata,
+     FlashAttentionMetadataBuilder,
+ )
+-from vllm.v1.kv_cache_interface import (
+-    FullAttentionSpec,
+-    KVCacheSpec,
+-    SlidingWindowSpec,
++from vllm.v1.core.single_type_kv_cache_manager import (
++    FullAttentionManager,
++    SlidingWindowManager,
+ )
++from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayerConfig, KVCacheSpec
+ 
+ from ..configs import Inkling2ModelConfig
+ from .ops.attention import (
+@@ -41,7 +44,9 @@ from .ops.attention import (
+     plan_decode_attention,
+     rel_decode_attention,
+ )
++from .ops.linear import decode_linear
+ from .ops.sconv import attention_prologue, shift_rel_proj
++from .ops.segment_gemv import segment_gemv
+ from .sconv import K_STREAM, V_STREAM, Inkling2ShortConv, conv_metadata
+ 
+ 
+@@ -52,6 +57,17 @@ class Inkling2AttentionMetadataBuilder(FlashAttentionMetadataBuilder):
+         super().__init__(*args, **kwargs)
+         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+ 
++    @classmethod
++    def get_varlen_cudagraph_max_query_len(
++        cls, vllm_config: VllmConfig, kv_cache_spec: KVCacheSpec
++    ) -> int | None:
++        # The prologue and `rel_decode_attention` read the per-request query
++        # rows from the device `query_start_loc`; the host `max_query_len`
++        # (and so the split plan) is only the graph's per-request bound. This
++        # lets adaptive verification replay a window graph with fewer drafts.
++        del kv_cache_spec
++        return max_decode_query_len(vllm_config)
++
+ 
+ class Inkling2AttentionBackend(FlashAttentionBackend):
+     @staticmethod
+@@ -59,12 +75,74 @@ class Inkling2AttentionBackend(FlashAttentionBackend):
+         return Inkling2AttentionMetadataBuilder
+ 
+ 
++def _kv_cache_layer_config(
++    vllm_config: VllmConfig,
++    num_kv_heads: int,
++    head_dim: int,
++    sliding_window: int | None,
++) -> KVCacheLayerConfig:
++    # The allocation policy lives in the managers since #61452.
++    spec = AttentionSpec(
++        block_size=vllm_config.cache_config.block_size,
++        num_kv_heads=num_kv_heads,
++        head_size=head_dim,
++        dtype=kv_cache_dtype_str_to_dtype(
++            vllm_config.cache_config.cache_dtype, vllm_config.model_config
++        ),
++    )
++    if sliding_window is not None:
++        return SlidingWindowManager.layer_config(spec, sliding_window=sliding_window)
++    return FullAttentionManager.layer_config(spec)
++
++
++class Inkling2AttentionPassCache(nn.Module, AttentionLayerBase):
++    """The KV cache of one extra loop pass of a looped `Inkling2Attention`
++    (each pass of the loop core attends over its own keys and values)."""
++
++    def __init__(
++        self,
++        prefix: str,
++        num_heads: int,
++        num_kv_heads: int,
++        head_dim: int,
++        sliding_window: int | None,
++    ) -> None:
++        super().__init__()
++        self.prefix = prefix
++        # Read by the metadata builders of the layer's attention group.
++        self.num_heads = num_heads
++        self.num_kv_heads = num_kv_heads
++        self.head_dim = head_dim
++        self.sliding_window = sliding_window
++        self.kv_cache = torch.tensor([])
++        forward_context = get_current_vllm_config().compilation_config
++        if prefix in forward_context.static_forward_context:
++            raise ValueError(f"Duplicate layer name: {prefix}")
++        forward_context.static_forward_context[prefix] = self
++
++    def get_attn_backend(self) -> type[AttentionBackend]:
++        return Inkling2AttentionBackend
++
++    def get_kv_cache_config(self, vllm_config: VllmConfig) -> KVCacheLayerConfig:
++        return _kv_cache_layer_config(
++            vllm_config, self.num_kv_heads, self.head_dim, self.sliding_window
++        )
++
++
+ class Inkling2Attention(nn.Module, AttentionLayerBase):
+     """Inkling2 attention for one decoder layer.
+ 
+     Local layers project all of q/k/v from one input; full layers project the
+     query side (q, r, gate, sink) from `x_q`, k from `x_k` and v from
+-    `x_v`, and use dynamic K/V convolutions and log-scaled q/r.
++    `x_v`, and use dynamic K/V convolutions and log-scaled q/r. Local layers
++    given separate `x_k` / `x_v` (loop passes after the first) project them
++    as full layers do.
++
++    A loop core layer runs once per loop pass, each pass with its own KV and
++    conv-state caches: `conv_states[p]` and pass `p`'s KV cache (this layer's
++    for pass 0, `pass_caches[p - 1]` after). With `loop_share_cache`, every
++    pass reads and writes this layer's KV cache (later tokens see the last
++    pass's K/V).
+     """
+ 
+     def __init__(
+@@ -73,6 +151,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+         is_local: bool,
+         conv_state: InklingConvState,
+         prefix: str,
++        pass_conv_states: tuple[InklingConvState, ...] = (),
+     ) -> None:
+         super().__init__()
+         self.prefix = prefix
+@@ -151,6 +230,17 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+             )
+ 
+         self.conv_state = conv_state
++        self.conv_states = (conv_state, *pass_conv_states)
++        self.pass_caches = nn.ModuleList(
++            Inkling2AttentionPassCache(
++                f"{prefix}.pass{p}",
++                self.num_heads,
++                self.num_kv_heads,
++                self.head_dim,
++                self.sliding_window if is_local else None,
++            )
++            for p in range(1, 1 if config.loop_share_cache else len(self.conv_states))
++        )
+         self.k_sconv, self.v_sconv = (
+             Inkling2ShortConv(
+                 kv_size,
+@@ -164,7 +254,13 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+         )
+ 
+         vllm_config = get_current_vllm_config()
+-        assert vllm_config.cache_config.cache_dtype in ("auto", "bfloat16")
++        cache_dtype = vllm_config.cache_config.cache_dtype
++        supported = ("auto", "bfloat16", "fp8", "fp8_e4m3")
++        if cache_dtype not in supported:
++            raise ValueError(f"Inkling2 KV cache dtype must be one of {supported}")
++        # Unit-scale OCP E4M3 (gfx12 has native FP8): the prologue writes it,
++        # the attention kernels upcast it to the query dtype.
++        self.fp8_kv = cache_dtype in ("fp8", "fp8_e4m3")
+         self.kv_cache = torch.tensor([])
+         forward_context = vllm_config.compilation_config.static_forward_context
+         if prefix in forward_context:
+@@ -177,41 +273,67 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+     def get_attn_backend(self) -> type[AttentionBackend]:
+         return Inkling2AttentionBackend
+ 
+-    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+-        block_size = vllm_config.cache_config.block_size
+-        if self.is_local:
+-            return SlidingWindowSpec(
+-                block_size=block_size,
+-                num_kv_heads=self.num_kv_heads,
+-                head_size=self.head_dim,
+-                dtype=vllm_config.model_config.dtype,
+-                sliding_window=self.sliding_window,
+-            )
+-        return FullAttentionSpec(
+-            block_size=block_size,
+-            num_kv_heads=self.num_kv_heads,
+-            head_size=self.head_dim,
+-            dtype=vllm_config.model_config.dtype,
++    def get_kv_cache_config(self, vllm_config: VllmConfig) -> KVCacheLayerConfig:
++        return _kv_cache_layer_config(
++            vllm_config,
++            self.num_kv_heads,
++            self.head_dim,
++            self.sliding_window if self.is_local else None,
+         )
+ 
++    def _pass_cache(self, pass_idx: int) -> tuple[str, torch.Tensor]:
++        """The attention metadata key and KV cache of loop pass `pass_idx`."""
++        if pass_idx == 0 or not self.pass_caches:
++            return self.prefix, self.kv_cache
++        cache = self.pass_caches[pass_idx - 1]
++        return cache.prefix, cache.kv_cache
++
+     def _project(
+         self, x_q: torch.Tensor, x_k: torch.Tensor, x_v: torch.Tensor
+-    ) -> list[torch.Tensor]:
++    ) -> list[torch.Tensor | None]:
++        """q, r, gate, sinks, k, v and the K/V convs' dynamic taps (None for
++        static convs)."""
+         weight = self.qkvr.weight
+-        if self.is_local:
+-            projected = nn.functional.linear(x_q, weight)
+-            return list(projected.split(self.split_sizes, dim=-1)[:6])
++        if x_k is x_q and x_v is x_q:
++            projected = decode_linear(x_q, weight)
++            return [*projected.split(self.split_sizes, dim=-1)[:6], None, None]
+         q_side, kv_size = sum(self.split_sizes[:4]), self.split_sizes[4]
+         k_end = q_side + kv_size
+-        projected = nn.functional.linear(x_q, weight[: sum(self.q_side_splits)])
+-        k = nn.functional.linear(x_k, weight[q_side:k_end])
+-        v = nn.functional.linear(x_v, weight[k_end : k_end + kv_size])
+-        return [*projected.split(self.q_side_splits, dim=-1)[:4], k, v]
+-
+-    def _split_kv_cache(self) -> tuple[torch.Tensor, torch.Tensor]:
+-        key_cache, value_cache = self.kv_cache.transpose(1, 2).split(
+-            self.head_dim, dim=-1
+-        )
++        pairs = [
++            (x_q, weight[: sum(self.q_side_splits)]),
++            (x_k, weight[q_side:k_end]),
++            (x_v, weight[k_end : k_end + kv_size]),
++        ]
++        dynamic = self.k_sconv.dynamic and self.k_sconv.dynamic_taps_gemv
++        if dynamic:
++            pairs += [(x_k, self.k_sconv.weight_proj), (x_v, self.v_sconv.weight_proj)]
++        outs = None
++        if (
++            all(
++                x.dim() == 2 and x.shape[0] == 1 and x.stride(-1) == 1
++                for x in (x_k, x_v)
++            )
++            and x_q.shape[0] == 1
++            and x_q.dtype == weight.dtype == torch.bfloat16
++        ):
++            # Batch-1 decode: the layer's GEMVs in one launch.
++            outs = segment_gemv(pairs)
++        if outs is None:
++            outs = [decode_linear(x, w) for x, w in pairs]
++        if not dynamic:
++            outs += [
++                self.k_sconv.dynamic_taps(x_k),
++                self.v_sconv.dynamic_taps(x_v),
++            ]
++        projected, *rest = outs
++        return [*projected.split(self.q_side_splits, dim=-1)[:4], *rest]
++
++    def _split_kv_cache(
++        self, kv_cache: torch.Tensor
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        if self.fp8_kv:
++            kv_cache = kv_cache.view(torch.float8_e4m3fn)
++        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_dim, dim=-1)
+         return (
+             canonicalize_singleton_dim_strides(key_cache),
+             canonicalize_singleton_dim_strides(value_cache),
+@@ -224,17 +346,19 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+         x_k: torch.Tensor | None = None,
+         x_v: torch.Tensor | None = None,
+         tau: torch.Tensor | None = None,
++        pass_idx: int = 0,
+     ) -> torch.Tensor:
+         """Return this rank's bf16 `(T, hidden)` partial output (to be
+         all-reduced over TP).
+ 
+-        Local layers read q/k/v from `x_q`; full layers take `x_k`, `x_v` and
+-        the fp32 log-scaling `tau` for q/r.
++        Local layers read q/k/v from `x_q` (or `x_k` / `x_v` if given); full
++        layers take `x_k`, `x_v` and the fp32 log-scaling `tau` for q/r.
++        `pass_idx` picks the loop pass's caches.
+         """
+-        if self.is_local:
++        if self.is_local and x_k is None:
+             x_k = x_v = x_q
+         assert x_k is not None and x_v is not None
+-        q, r, gate, sinks, k, v = self._project(x_q, x_k, x_v)
++        q, r, gate, sinks, k, v, k_dynamic, v_dynamic = self._project(x_q, x_k, x_v)
+         output = torch.empty(gate.shape, dtype=q.dtype, device=q.device)
+         self._attention(
+             positions,
+@@ -244,12 +368,13 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+             sinks,
+             k,
+             v,
+-            self.k_sconv.dynamic_taps(x_k),
+-            self.v_sconv.dynamic_taps(x_v),
++            k_dynamic,
++            v_dynamic,
+             tau,
+             output,
++            pass_idx,
+         )
+-        return nn.functional.linear(output, self.wo_ud.weight)
++        return decode_linear(output, self.wo_ud.weight)
+ 
+     @eager_break_during_capture
+     def _attention(
+@@ -265,6 +390,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+         v_dynamic: torch.Tensor | None,
+         tau: torch.Tensor | None,
+         output: torch.Tensor,
++        pass_idx: int = 0,
+     ) -> None:
+         """Write the gated attention output to `output`.
+ 
+@@ -274,15 +400,17 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+         token count.
+         """
+         attn_metadata = get_forward_context().attn_metadata
+-        if not isinstance(attn_metadata, dict) or self.kv_cache.numel() == 0:
++        layer_name, kv_cache = self._pass_cache(pass_idx)
++        conv_state = self.conv_states[pass_idx]
++        if not isinstance(attn_metadata, dict) or kv_cache.numel() == 0:
+             output.zero_()
+             return
+-        md = cast(FlashAttentionMetadata, attn_metadata[self.prefix])
+-        conv_md = conv_metadata(self.conv_state)
++        md = cast(FlashAttentionMetadata, attn_metadata[layer_name])
++        conv_md = conv_metadata(conv_state)
+         assert conv_md is not None
+         num_tokens = q.shape[0]
+         q = q.view(num_tokens, self.num_heads, self.head_dim)
+-        key_cache, value_cache = self._split_kv_cache()
++        key_cache, value_cache = self._split_kv_cache(kv_cache)
+         clipped_q = q.new_empty(q.shape)
+         # Sheared as `rel_attention` reads it (see attention_prologue).
+         rel_logits = q.new_empty(
+@@ -301,7 +429,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+             self.v_sconv.conv_weight,
+             k_dynamic,
+             v_dynamic,
+-            self.conv_state.kv_cache,
++            conv_state.kv_cache,
+             positions,
+             conv_md.block_table,
+             conv_md.seq_idx,
+diff --git a/vllm/models/inkling2/amd/dspark.py b/vllm/models/inkling2/amd/dspark.py
+index 658752ba51..ccecb40e25 100644
+--- a/vllm/models/inkling2/amd/dspark.py
++++ b/vllm/models/inkling2/amd/dspark.py
+@@ -6,6 +6,7 @@ recurrent (`rnn_hidden`) Markov head. Numerics follow the reference
+ implementation's draft (RMSNorms as flashinfer's, bf16 logits)."""
+ 
+ from collections.abc import Iterable
++from dataclasses import replace
+ from typing import cast
+ 
+ import torch
+@@ -34,6 +35,10 @@ from vllm.v1.attention.backends.flash_attn import (
+     FlashAttentionImpl,
+     FlashAttentionMetadata,
+ )
++from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
++    triton_reshape_and_cache_flash,
++)
++from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayerConfig
+ 
+ from ..configs import Inkling2DSparkConfig
+ from ..speculator_config import Inkling2DSparkSpeculatorConfig
+@@ -47,9 +52,43 @@ from .ops.dspark import (
+     rope_,
+     silu_and_mul,
+ )
++from .ops.linear import decode_linear
+ from .ops.norm import fused_add_rms_norm, rms_norm
+ 
+ 
++class _DraftCacheImpl(FlashAttentionImpl):
++    """The draft layers own their paged cache only: they write and read it
++    with their own Triton kernels, never through this impl, so it also takes
++    the unit-scale FP8 cache that FlashAttention cannot read on ROCm."""
++
++    def __init__(self, *args, **kwargs) -> None:
++        args_list = list(args)
++        kv_cache_dtype = args_list[6]
++        args_list[6] = "auto"
++        super().__init__(*args_list, **kwargs)
++        self.kv_cache_dtype = kv_cache_dtype
++
++
++class _DraftCacheBackend(FlashAttentionBackend):
++    @staticmethod
++    def get_impl_cls() -> type[FlashAttentionImpl]:
++        return _DraftCacheImpl
++
++
++class _DraftAttention(Attention):
++    """A draft layer's paged cache. An FP8 cache keeps the BF16 cache's page
++    (twice the tokens per block): a smaller page would make the planner
++    shrink every page of the target to it."""
++
++    def get_kv_cache_config(self, vllm_config: VllmConfig) -> KVCacheLayerConfig | None:
++        config = super().get_kv_cache_config(vllm_config)
++        if config is None or not self.kv_cache_dtype.startswith("fp8"):
++            return config
++        spec = config.spec
++        assert isinstance(spec, AttentionSpec)
++        return replace(config, spec=replace(spec, block_size=2 * spec.block_size))
++
++
+ class _RMSNorm(nn.Module):
+     def __init__(self, hidden_size: int, eps: float) -> None:
+         super().__init__()
+@@ -115,21 +154,35 @@ class Inkling2DraftSelfAttention(nn.Module):
+         self.q_norm = _RMSNorm(self.head_dim, self.eps)
+         self.k_norm = _RMSNorm(self.head_dim, self.eps)
+         self.k_norm_ctx = _RMSNorm(self.head_dim, self.eps)
++        # Positions before the block this layer reads: the local window, or
++        # for the global layer the whole context unless `draft_context` caps
++        # it (`speculator_options`; verification stays exact, so a cap only
++        # trades acceptance for KV memory).
++        draft_context = getattr(config, "draft_context", 0) or None
++        # The draft's cache dtype is `speculative_config.kv_cache_dtype`
++        # (BF16 unless unit-scale FP8 is asked for), not the target's.
++        vllm_config = get_current_vllm_config()
++        spec_config = vllm_config.speculative_config
++        cache_config = replace(
++            vllm_config.cache_config,
++            cache_dtype=(spec_config and spec_config.kv_cache_dtype) or "auto",
++        )
++        context = config.sliding_window_size if is_local else draft_context
+         # Owns the paged KV cache only; the same spec as the target's layers
+-        # (the scheduler keeps the last sliding_window_size positions before
+-        # the block, which is what the draft reads).
+-        self.attn = Attention(
++        # (the scheduler keeps the last `context` positions before the block,
++        # which is what the draft reads).
++        self.attn = _DraftAttention(
+             self.num_heads,
+             self.head_dim,
+             self.head_dim**-0.5,
+             num_kv_heads=self.num_kv_heads,
+-            per_layer_sliding_window=config.sliding_window_size if is_local else None,
++            per_layer_sliding_window=context,
++            cache_config=cache_config,
+             prefix=f"{prefix}.attn",
+-            attn_backend=FlashAttentionBackend,
++            attn_backend=_DraftCacheBackend,
+         )
+-        # Keys a block sees: itself and, if local, the window before it.
+-        self.window = config.sliding_window_size + self.block if is_local else 0
+-        vllm_config = get_current_vllm_config()
++        # Keys a block sees: itself and the `context` before it (0: all).
++        self.window = context + self.block if context else 0
+         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+         self.register_buffer(
+             "cu_seqlens_q",
+@@ -143,16 +196,45 @@ class Inkling2DraftSelfAttention(nn.Module):
+             return None
+         return cast(FlashAttentionMetadata, attn_metadata[self.attn.layer_name])
+ 
++    def _cache(self) -> torch.Tensor:
++        """The paged `(B, H, N, 2 * D)` K | V cache; an FP8 cache (uint8
++        storage) is viewed as E4M3, which the readers upcast with unit
++        scale."""
++        cache = self.attn.kv_cache
++        if self.attn.kv_cache_dtype.startswith("fp8"):
++            cache = cache.view(torch.float8_e4m3fn)
++        return cache
++
+     def _write_kv(
+         self, k: torch.Tensor, v: torch.Tensor, slot_mapping: torch.Tensor
+     ) -> None:
+-        impl = cast(FlashAttentionImpl, self.attn.impl)
+-        impl.do_kv_cache_update(self.attn, k, v, self.attn.kv_cache, slot_mapping)
++        """Scatter `k`/`v` into the draft cache as the target's layers store
++        theirs. The FlashAttention impl's write needs upstream flash-attn's
++        import path, which ROCm lacks, so this calls the Triton store on the
++        same `(B, H, N, 2 * D)` -> `(B, N, H, D)` K | V views the readers use.
++        Unit-scale FP8 saturates at the E4M3 range (the store does not)."""
++        if self.attn.kv_cache_dtype.startswith("fp8"):
++            fp8_max = torch.finfo(torch.float8_e4m3fn).max
++            k = k.clamp(-fp8_max, fp8_max)
++            v = v.clamp(-fp8_max, fp8_max)
++        key_cache, value_cache = (
++            self._cache().transpose(1, 2).split(self.head_dim, dim=-1)
++        )
++        triton_reshape_and_cache_flash(
++            k,
++            v,
++            key_cache,
++            value_cache,
++            slot_mapping,
++            self.attn.kv_cache_dtype,
++            self.attn._k_scale,
++            self.attn._v_scale,
++        )
+ 
+     def forward(
+         self, positions: torch.Tensor, x: torch.Tensor, cos_sin_cache: torch.Tensor
+     ) -> torch.Tensor:
+-        qkv = nn.functional.linear(x, self.qkv_proj.weight)
++        qkv = decode_linear(x, self.qkv_proj.weight)
+         qk_norm_rope_(
+             qkv,
+             positions,
+@@ -172,8 +254,8 @@ class Inkling2DraftSelfAttention(nn.Module):
+                 v.view(-1, self.num_kv_heads, self.head_dim),
+                 md.slot_mapping[: q.shape[0]],
+             )
+-            key_cache, value_cache = self.attn.kv_cache.transpose(1, 2).split(
+-                self.head_dim, dim=-1
++            key_cache, value_cache = (
++                self._cache().transpose(1, 2).split(self.head_dim, dim=-1)
+             )
+             num_reqs = min(q.shape[0] // self.block, md.seq_lens.shape[0])
+             num_tokens = num_reqs * self.block
+@@ -202,7 +284,7 @@ class Inkling2DraftSelfAttention(nn.Module):
+                 window=self.window,
+                 num_splits=num_splits,
+             )
+-        return nn.functional.linear(out, self.o_proj.weight)
++        return decode_linear(out, self.o_proj.weight)
+ 
+     def store_context_kv(
+         self,
+@@ -211,7 +293,7 @@ class Inkling2DraftSelfAttention(nn.Module):
+         cos_sin_cache: torch.Tensor,
+         slot_mapping: torch.Tensor | None,
+     ) -> None:
+-        k, v = nn.functional.linear(context, self.kv_proj_ctx.weight).split(
++        k, v = decode_linear(context, self.kv_proj_ctx.weight).split(
+             [self.kv_size, self.kv_size], -1
+         )
+         k = self.k_norm_ctx(k.reshape(-1, self.head_dim))
+@@ -240,8 +322,8 @@ class Inkling2DraftMLP(nn.Module):
+         )
+ 
+     def forward(self, x: torch.Tensor) -> torch.Tensor:
+-        x = silu_and_mul(nn.functional.linear(x, self.gate_up_proj.weight))
+-        return nn.functional.linear(x, self.down_proj.weight)
++        x = silu_and_mul(decode_linear(x, self.gate_up_proj.weight))
++        return decode_linear(x, self.down_proj.weight)
+ 
+ 
+ class Inkling2DraftLayer(nn.Module):
+@@ -304,12 +386,14 @@ class Inkling2MarkovHead(nn.Module):
+ 
+     @torch.no_grad()
+     def fold(self, lm_head_weight: torch.Tensor) -> None:
+-        """Fold `hidden_out` into the (TP-local) LM head rows in fp64."""
++        """Fold `hidden_out` into the (TP-local) LM head rows in fp64. Later
++        calls refill the same tensors, which HIP graphs keep pointing at."""
+         projection = self.hidden_out.weight.double()
+         bias = self.hidden_out.bias.double()
+         num_rows = lm_head_weight.shape[0]
+-        self.fold_weight = lm_head_weight.new_empty((num_rows, self.markov_rank))
+-        self.fold_bias = lm_head_weight.new_empty((num_rows,))
++        if self.fold_weight is None or self.fold_bias is None:
++            self.fold_weight = lm_head_weight.new_empty((num_rows, self.markov_rank))
++            self.fold_bias = lm_head_weight.new_empty((num_rows,))
+         for start in range(0, num_rows, 4096):
+             rows = slice(start, start + 4096)
+             head = lm_head_weight[rows].double()
+@@ -447,12 +531,23 @@ class Inkling2DSparkModel(nn.Module):
+         assert self.lm_head is not None and self.lm_head.weight.dtype == torch.bfloat16
+         self.model.embed_norm = target_model.model.embed_norm
+         head = self.model.markov_head
+-        head.fold(self.lm_head.weight)
+-        head.rnn_bias = head.rnn_proj.bias.float()
++        head.rnn_bias = torch.empty_like(head.rnn_proj.bias, dtype=torch.float32)
+         num_cols = self.lm_head.weight.shape[0]
+         vocab_offset = get_tensor_model_parallel_rank() * num_cols
+         self.valid_vocab = min(num_cols, self.config.vocab_size - vocab_offset)
+         assert self.valid_vocab > 0
++        self.refresh_derived_weights()
++
++    @torch.no_grad()
++    def refresh_derived_weights(self) -> None:
++        """Re-derive, in place, the weights computed from the target's LM head
++        and the draft's own weights; called again after the target's weights
++        are replaced (reload, RL weight transfer)."""
++        assert self.lm_head is not None
++        head = self.model.markov_head
++        assert head.rnn_bias is not None
++        head.fold(self.lm_head.weight)
++        head.rnn_bias.copy_(head.rnn_proj.bias)
+         self.model.fuse_alpha.copy_(
+             torch.softmax(self.model.fuse_weight.float(), dim=-1)
+         )
+diff --git a/vllm/models/inkling2/amd/loop.py b/vllm/models/inkling2/amd/loop.py
+new file mode 100644
+index 0000000000..91d109bcdf
+--- /dev/null
++++ b/vllm/models/inkling2/amd/loop.py
+@@ -0,0 +1,410 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Looped Inkling2 checkpoints (`loop_config`).
++
++The core layers `[core_start, core_end)` run `num_passes` times: a prelude,
++then each pass from the AttnRes state after the prelude, then the coda from
++the last pass's state. Each pass of a core layer has its own KV and
++conv-state caches. In passes after the first, every core sublayer input
++(attention q/k/v and MLP) is blended with a message: a normalized-value
++AttnRes read of the previous pass's blocks, merged by a gated low-rank
++controller.
++
++AMD port of `nvidia/loop.py`: each sublayer's short conv and the next AttnRes
++mix run as one launch for small batches (`ops.sconv.conv_mix`), and the TP > 1
++fused all-reduce paths are left out.
++"""
++
++from collections.abc import Sequence
++
++import torch
++from torch import nn
++
++from vllm.distributed import tensor_model_parallel_all_reduce
++
++from ..configs import Inkling2ModelConfig
++from .model import (
++    Inkling2DecoderLayer,
++    Inkling2ForConditionalGeneration,
++    Inkling2Model,
++)
++from .ops.attn_res import attn_res
++from .ops.linear import GEMV_ROWS_MAX, gemv, gemv_rows, linear_k_groups
++from .ops.loop import blend_rms_norm, pair_norm_gemv, pair_rms_norm
++from .quant_config import Inkling2QuantConfig
++
++LOOP_STREAMS = ("attn", "k", "v", "mlp")
++# Batches of up to this many tokens mix a pass's messages in one launch.
++PASS_MESSAGES_MAX_TOKENS = 16
++
++
++class Inkling2MessageController(nn.Module):
++    """Blends a loop message into a core sublayer input: from the rank-`r`
++    projection `h` of the RMS-normalized `[dest, message]`,
++    `(1 - tanh(forget(h))) * dest + tanh(gain(h)) * message` in fp32.
++
++    The weights are views of the layer's stream-stacked weights
++    (`Inkling2LoopDecoderLayer`), which run every stream at once; `forward`
++    is the per-stream reference.
++    """
++
++    def __init__(
++        self, down: torch.Tensor, gain: torch.Tensor, forget: torch.Tensor
++    ) -> None:
++        super().__init__()
++        self.down_weight = nn.Parameter(down, requires_grad=False)
++        self.gain_weight = nn.Parameter(gain, requires_grad=False)
++        self.forget_weight = nn.Parameter(forget, requires_grad=False)
++
++    def forward(self, dest: torch.Tensor, message: torch.Tensor) -> torch.Tensor:
++        """fp32 `(T, D)` `dest` and `message` -> fp32 `(T, D)`."""
++        pair = torch.stack((dest, message), dim=1)
++        pair = pair * torch.rsqrt(pair.square().mean(-1, keepdim=True) + 1e-6)
++        normalized = pair.to(torch.bfloat16).flatten(1)
++        hidden = linear_k_groups(normalized, self.down_weight, torch.bfloat16)
++        gain = torch.mm(hidden, self.gain_weight.t(), out_dtype=torch.float32)
++        forget = torch.mm(hidden, self.forget_weight.t(), out_dtype=torch.float32)
++        return (1.0 - torch.tanh(forget)) * dest + torch.tanh(gain) * message
++
++
++class Inkling2LoopDecoderLayer(Inkling2DecoderLayer):
++    """A loop core layer: per-pass caches and a message controller per
++    stream (`LOOP_STREAMS`), whose weights are stacked over the streams."""
++
++    def __init__(
++        self,
++        config: Inkling2ModelConfig,
++        layer_id: int,
++        quant_config: Inkling2QuantConfig | None,
++        prefix: str,
++    ) -> None:
++        super().__init__(
++            config, layer_id, quant_config, prefix, num_passes=config.num_loop_passes
++        )
++        assert config.loop_config is not None
++        rank, width = config.loop_config["gate_rank"], config.hidden_size
++        streams = len(LOOP_STREAMS)
++        # down (S, r, 2D) and [gain; forget] (S, 2D, r), bf16.
++        self.register_buffer(
++            "controller_down",
++            torch.empty(streams, rank, 2 * width, dtype=torch.bfloat16),
++            persistent=False,
++        )
++        self.register_buffer(
++            "controller_gain_forget",
++            torch.empty(streams, 2 * width, rank, dtype=torch.bfloat16),
++            persistent=False,
++        )
++        self.controllers = nn.ModuleDict(
++            {
++                stream: Inkling2MessageController(
++                    self.controller_down[i],
++                    self.controller_gain_forget[i, :width],
++                    self.controller_gain_forget[i, width:],
++                )
++                for i, stream in enumerate(LOOP_STREAMS)
++            }
++        )
++
++    def process_weights_after_loading(self) -> None:
++        # The controllers' weights must still alias the stacked ones.
++        for i, controller in enumerate(self.controllers.values()):
++            down, gain_forget = self.controller_down, self.controller_gain_forget
++            assert controller.down_weight.data_ptr() == down[i].data_ptr()
++            assert controller.gain_weight.data_ptr() == gain_forget[i].data_ptr()
++
++    def blend(
++        self,
++        streams: slice,
++        dest: torch.Tensor,
++        message: torch.Tensor,
++        norm_weight: torch.Tensor,
++        norm_eps: float,
++    ) -> torch.Tensor:
++        """The `streams` controllers on fp32 `(S, T, D)` `dest` (may
++        broadcast over streams) and `message`, each output RMS-normalized
++        with its row of `norm_weight` `(S, D)`: bf16 `(S, T, D)`."""
++        down = self.controller_down[streams]
++        gain_forget_weight = self.controller_gain_forget[streams]
++        if message.shape[1] == 1:
++            # Batch-1 decode: one-row GEMVs read the weights faster; the
++            # first also applies the pair's RMSNorm.
++            hidden = pair_norm_gemv(dest, message, down)
++            gain_forget = gemv(hidden, gain_forget_weight, torch.float32)
++        elif message.shape[1] <= GEMV_ROWS_MAX:
++            # Spec-decode verify windows: each weight read once for all rows.
++            pair = pair_rms_norm(dest, message)
++            hidden = gemv_rows(pair, down)
++            gain_forget = gemv_rows(hidden, gain_forget_weight, torch.float32)
++        else:
++            pair = pair_rms_norm(dest, message)
++            hidden = torch.bmm(pair, down.transpose(1, 2))
++            gain_forget = torch.bmm(
++                hidden, gain_forget_weight.transpose(1, 2), out_dtype=torch.float32
++            )
++        return blend_rms_norm(dest, message, gain_forget, norm_weight, norm_eps)
++
++
++class Inkling2LoopModel(Inkling2Model):
++    def __init__(
++        self,
++        config: Inkling2ModelConfig,
++        quant_config: Inkling2QuantConfig | None,
++        prefix: str,
++    ) -> None:
++        # Serving options set through --hf-overrides skip the constructor.
++        config.check_loop_options()
++        super().__init__(config, quant_config, prefix)
++        self.loop_core = config.loop_core_layers
++        self.hidden_size = config.hidden_size
++        # Message pseudo-queries (raw), two per core layer: attn/mlp and k/v.
++        shape = (2 * len(self.loop_core), config.hidden_size)
++        self.middle_cycle_cross_pass_queries = nn.Parameter(
++            torch.zeros(shape, dtype=torch.float32), requires_grad=False
++        )
++        self.middle_cycle_cross_pass_kv_queries = nn.Parameter(
++            torch.zeros(shape, dtype=torch.float32), requires_grad=False
++        )
++        # Per core layer, the `LOOP_STREAMS` queries scaled by D**-0.5.
++        self.register_buffer(
++            "message_queries",
++            torch.zeros(
++                len(self.loop_core),
++                len(LOOP_STREAMS),
++                config.hidden_size,
++                dtype=torch.float32,
++            ),
++            persistent=False,
++        )
++
++    def process_weights_after_loading(self) -> None:
++        queries = self.middle_cycle_cross_pass_queries.view(-1, 2, self.hidden_size)
++        kv_queries = self.middle_cycle_cross_pass_kv_queries.view(
++            -1, 2, self.hidden_size
++        )
++        # (attn, k, v, mlp) = (queries[0], kv[0], kv[1], queries[1]).
++        stacked = torch.stack(
++            (queries[:, 0], kv_queries[:, 0], kv_queries[:, 1], queries[:, 1]), 1
++        )
++        self.message_queries.copy_(stacked * self.hidden_size**-0.5)
++
++    def _make_layer(
++        self,
++        config: Inkling2ModelConfig,
++        layer_id: int,
++        quant_config: Inkling2QuantConfig | None,
++        prefix: str,
++    ) -> Inkling2DecoderLayer:
++        if layer_id in config.loop_core_layers:
++            return Inkling2LoopDecoderLayer(config, layer_id, quant_config, prefix)
++        return super()._make_layer(config, layer_id, quant_config, prefix)
++
++    def _max_loop_blocks(self) -> int:
++        """Completed AttnRes blocks a loop forward holds at most: each pass
++        restarts from the prelude's, and the coda continues the last pass."""
++        num_blocks = max_blocks = 0
++        core = self.loop_core
++        for i in [*range(core.start), *core, *range(core.stop, len(self.layers))]:
++            num_blocks += i % self.block_size == 0
++            max_blocks = max(max_blocks, num_blocks)
++        return max_blocks
++
++    def _run_layer(
++        self,
++        i: int,
++        pass_idx: int,
++        stack: torch.Tensor,
++        num_blocks: int,
++        inputs: torch.Tensor | None,
++        messages: torch.Tensor | None,
++        next_query: torch.Tensor,
++        next_norm: nn.Module | None,
++        positions: torch.Tensor,
++        tau: torch.Tensor | None,
++    ) -> tuple[int, torch.Tensor]:
++        """Run decoder layer `i` in loop pass `pass_idx` on its `inputs`
++        (the attention inputs; for a visit with `messages`, its four
++        streams' fp32 messages, the fp32 mixes they blend into). Returns the
++        number of completed AttnRes blocks after it and the mixes of its
++        output with `next_query` through `next_norm` (fp32 without it), the
++        next visit's inputs."""
++        layer = self.layers[i]
++        partial = stack[num_blocks]
++        owner = layer.conv_states[pass_idx]
++        attn_inputs: Sequence[torch.Tensor]
++        if messages is not None:
++            assert isinstance(layer, Inkling2LoopDecoderLayer) and inputs is not None
++            norm = layer.attn_norm
++            dests, norm_weight = inputs, norm.weight
++            if layer.is_local:
++                dests = dests.expand(3, -1, -1)
++                norm_weight = norm_weight.expand(3, -1)
++            attn_inputs = layer.blend(
++                slice(0, 3), dests, messages[:3], norm_weight, norm.eps
++            )
++        elif inputs is None:
++            assert num_blocks == 0
++            attn_inputs = [
++                layer.attn_norm(partial, j) for j in range(layer.num_attn_inputs)
++            ]
++        else:
++            attn_inputs = inputs
++        attn_partial = layer.attention(positions, attn_inputs, tau, pass_idx=pass_idx)
++
++        # The MLP input mixes the blocks with (partial +) attn_out.
++        first = i % self.block_size == 0
++        attn_out = torch.empty_like(partial)
++        mix_args = (
++            positions,
++            attn_out,
++            stack[: num_blocks + first],
++            None if first else partial,
++            self.attn_res.mlp_queries[i],
++            None if messages is not None else layer.mlp_norm,
++        )
++        attn_reduced = tensor_model_parallel_all_reduce(attn_partial)
++        mlp_in = layer.attn_sconv.conv_mix(attn_reduced, *mix_args, owner=owner)
++        if messages is not None:
++            assert isinstance(layer, Inkling2LoopDecoderLayer)
++            norm = layer.mlp_norm
++            mlp_in = layer.blend(
++                slice(3, 4), mlp_in, messages[3:], norm.weight, norm.eps
++            )
++
++        # The MLP short conv also applies the residual update.
++        residual = None if first else partial
++        if residual is None:
++            num_blocks += 1
++        mix_args = (
++            positions,
++            stack[num_blocks],
++            stack[:num_blocks],
++            None,
++            next_query,
++            next_norm,
++        )
++        # The MoE output is all-reduced (in bf16) inside layer.mlp.
++        outputs = layer.mlp_sconv.conv_mix(
++            layer.mlp(mlp_in[0], pass_idx=pass_idx),
++            *mix_args,
++            addend=attn_out,
++            residual=residual,
++            owner=owner,
++        )
++        return num_blocks, outputs
++
++    def forward(
++        self, positions: torch.Tensor, inputs_embeds: torch.Tensor
++    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
++        """Prelude, `num_passes` core passes, then the coda. Each sublayer's
++        short conv runs, then the next AttnRes mix."""
++        num_tokens, hidden = inputs_embeds.shape
++        core = self.loop_core
++        num_passes = self.config.num_loop_passes
++        stack = inputs_embeds.new_empty(
++            (self._max_loop_blocks() + 1, num_tokens, hidden)
++        )
++        stack[0].copy_(inputs_embeds)
++        tau = self._log_scaling_tau(positions)
++        # (layer, pass) visits; the prelude and coda run as pass 0.
++        visits = [(i, 0) for i in range(core.start)]
++        visits += [(i, p) for p in range(num_passes) for i in core]
++        visits += [(i, 0) for i in range(core.stop, len(self.layers))]
++        aux_hidden_states = []
++        next_norm: nn.Module | None
++        num_blocks = 0
++        inputs = prelude_blocks = prelude_partial = prelude_dests = None
++        pass_messages = bank = None
++        num_streams = len(LOOP_STREAMS)
++        for visit, (i, pass_idx) in enumerate(visits):
++            looped = pass_idx > 0
++            if i == core.start and not looped:
++                prelude_blocks = num_blocks
++                prelude_partial = stack[num_blocks].clone()
++            elif i == core.start:
++                # Every pass restarts from the prelude's state, with the
++                # previous pass's blocks (after the prelude's) and partial as
++                # the messages' bank.
++                assert prelude_blocks is not None and prelude_partial is not None
++                bank = stack[prelude_blocks + 1 : num_blocks + 1]
++                if num_tokens <= PASS_MESSAGES_MAX_TOKENS:
++                    # Every core layer's four streams' messages, mixes of the
++                    # bank's two blocks, in one launch (each mix as its
++                    # layer's four-query launch would compute it).
++                    pass_messages = attn_res(
++                        bank[:1],
++                        bank[1],
++                        None,
++                        self.message_queries.view(-1, self.hidden_size),
++                        None,
++                        0.0,
++                        True,
++                        select_q=num_streams,
++                    )
++                else:
++                    # Larger batches mix per layer (the pass's messages would
++                    # take 48 fp32 rows per token) from a copy of the bank,
++                    # which the pass overwrites.
++                    pass_messages = None
++                    bank = bank.clone()
++                num_blocks = prelude_blocks
++                stack[num_blocks].copy_(prelude_partial)
++                if prelude_dests is None:
++                    query = self.attn_res.attn_queries[i - 1]
++                    prelude_dests = attn_res(
++                        stack[:num_blocks],
++                        prelude_partial,
++                        None,
++                        query,
++                        None,
++                        0.0,
++                        True,
++                    )
++                inputs = prelude_dests
++            if visit in self.aux_hidden_state_layers:
++                aux_hidden_states.append(stack[num_blocks].clone())
++            if visit + 1 == len(visits):
++                next_query, next_norm = self.attn_res.output_query, self.norm
++            else:
++                next_i, next_pass = visits[visit + 1]
++                next_query = self.attn_res.attn_queries[next_i - 1]
++                # Messages blend into fp32 mixes; a pass restart discards it.
++                next_norm = None if next_pass else self.layers[next_i].attn_norm
++            messages = None
++            if looped and pass_messages is not None:
++                j = (i - core.start) * num_streams
++                messages = pass_messages[j : j + num_streams]
++            elif looped:
++                assert bank is not None
++                # This layer's four streams' messages.
++                messages = attn_res(
++                    bank[:1],
++                    bank[1],
++                    None,
++                    self.message_queries[i - core.start],
++                    None,
++                    0.0,
++                    True,
++                )
++            num_blocks, inputs = self._run_layer(
++                i,
++                pass_idx,
++                stack,
++                num_blocks,
++                inputs,
++                messages,
++                next_query,
++                next_norm,
++                positions,
++                tau,
++            )
++        assert inputs is not None
++        out = inputs[0]
++        if self.aux_hidden_state_layers:
++            return out, [*aux_hidden_states, out]
++        return out
++
++
++class Inkling2LoopForConditionalGeneration(Inkling2ForConditionalGeneration):
++    """The `inkling2_loop` checkpoints' architecture name; the model is
++    `Inkling2ForConditionalGeneration` with an `Inkling2LoopModel`."""
+diff --git a/vllm/models/inkling2/amd/model.py b/vllm/models/inkling2/amd/model.py
+index e2070b7519..02536cb464 100644
+--- a/vllm/models/inkling2/amd/model.py
++++ b/vllm/models/inkling2/amd/model.py
+@@ -6,6 +6,8 @@ Decoder layers are tied together by block attention residuals: instead of a
+ single residual stream, each sublayer input is a learned softmax mix over the
+ outputs of previous blocks of `n_layers_per_attn_res_block` layers plus the
+ running partial block. Residual blocks are stored in bf16; mixes are fp32.
++
++Looped checkpoints (`loop_config`) are `Inkling2LoopModel` (`loop.py`).
+ """
+ 
+ from collections import Counter
+@@ -51,6 +53,7 @@ from .attention import Inkling2Attention
+ from .moe import Inkling2MoE
+ from .ops.attention import compute_log_scaling_tau
+ from .ops.attn_res import attn_res
++from .ops.linear import linear_k_groups
+ from .ops.norm import rms_norm
+ from .quant_config import Inkling2QuantConfig
+ from .sconv import ATTN_STREAM, MLP_STREAM, Inkling2ConvState, Inkling2ShortConv
+@@ -117,6 +120,43 @@ class Inkling2AttnRes(nn.Module):
+         param.data.copy_(weight.view(param.shape)).mul_(self.scale)
+ 
+ 
++class Inkling2RoutingCapture(nn.Module):
++    """A routed-experts capture row (`RoutedExpertsCaptureSource`): with
++    `enable_return_routed_experts`, vLLM binds `capture_fn` to record each
++    token's expert ids at row `layer_id` of the capture buffer."""
++
++    def __init__(self, layer_id: int) -> None:
++        super().__init__()
++        self.layer_id = layer_id
++        self.capture_fn: Callable[[torch.Tensor], None] | None = None
++
++
++class Inkling2LayerMoE(Inkling2MoE):
++    """`Inkling2MoE` with the NVIDIA layer's routed-experts capture: one
++    capture row per loop pass of the layer (`visit_ids`, from
++    `Inkling2ModelConfig.layer_visit_ids`), picked by `pass_idx`."""
++
++    def __init__(self, config, visit_ids: Sequence[int] = (0,), **kwargs) -> None:
++        super().__init__(config, **kwargs)
++        self.routing_captures = nn.ModuleList(
++            Inkling2RoutingCapture(visit) for visit in visit_ids
++        )
++
++    def routed_expert_ids(self, x: torch.Tensor) -> torch.Tensor:
++        """Each token's top-k expert ids `[T, topk]`: the routing kernel's
++        selection (`sigmoid(x @ gate.T) + bias`, fp32 K-group logits),
++        recomputed in torch. Only runs with routed-experts capture."""
++        gate = self.gate
++        logits = linear_k_groups(x, gate.weight)
++        return torch.topk(logits.sigmoid() + gate.bias, gate.topk).indices.int()
++
++    def forward(self, x: torch.Tensor, pass_idx: int = 0) -> torch.Tensor:
++        capture_fn = self.routing_captures[pass_idx].capture_fn
++        if capture_fn is not None:
++            capture_fn(self.routed_expert_ids(x.contiguous()))
++        return super().forward(x)
++
++
+ class Inkling2DecoderLayer(nn.Module):
+     def __init__(
+         self,
+@@ -124,7 +164,10 @@ class Inkling2DecoderLayer(nn.Module):
+         layer_id: int,
+         quant_config: Inkling2QuantConfig | None,
+         prefix: str,
++        num_passes: int = 1,
+     ) -> None:
++        """`num_passes > 1` (a loop core layer) gives each pass its own KV and
++        conv-state caches."""
+         super().__init__()
+         self.is_local = layer_id in config.local_layer_ids
+         num_kv_heads = (
+@@ -132,15 +175,23 @@ class Inkling2DecoderLayer(nn.Module):
+             if self.is_local
+             else config.num_key_value_heads
+         )
+-        self.conv_state = Inkling2ConvState(
+-            num_kv_heads=num_kv_heads,
+-            head_dim=config.swa_head_dim if self.is_local else config.head_dim,
+-            hidden_size=config.hidden_size,
+-            kernel_size=config.sconv_kernel_size,
+-            prefix=f"{prefix}.conv_state",
++        self.conv_states = tuple(
++            Inkling2ConvState(
++                num_kv_heads=num_kv_heads,
++                head_dim=config.swa_head_dim if self.is_local else config.head_dim,
++                hidden_size=config.hidden_size,
++                kernel_size=config.sconv_kernel_size,
++                prefix=f"{prefix}.conv_state" + (f".pass{p}" if p else ""),
++            )
++            for p in range(num_passes)
+         )
++        self.conv_state = self.conv_states[0]
+         self.attn = Inkling2Attention(
+-            config, self.is_local, self.conv_state, prefix=f"{prefix}.attn"
++            config,
++            self.is_local,
++            self.conv_state,
++            prefix=f"{prefix}.attn",
++            pass_conv_states=self.conv_states[1:],
+         )
+         eps = config.rms_norm_eps
+         # Local layers: attn_norm; full layers: q/k/v_input_norm, stacked.
+@@ -149,13 +200,16 @@ class Inkling2DecoderLayer(nn.Module):
+             config.hidden_size, eps, num_inputs=self.num_attn_inputs
+         )
+         self.mlp_norm = Inkling2RMSNorm(config.hidden_size, eps)
+-        if quant_config is None or not quant_config.is_mxfp8_layer(layer_id):
++        if quant_config is None:
+             raise ValueError(
+-                f"Inkling2 on ROCm runs MXFP8 experts only (layer {layer_id} "
+-                "is not MXFP8); use an all-MXFP8 checkpoint such as "
+-                "Inkling-2-Small-MXFP8"
++                "Inkling2 on ROCm needs a quantized checkpoint (NVFP4 or MXFP8 "
++                "experts); no inkling2 quant config was found"
+             )
+-        self.mlp = Inkling2MoE(config)
++        self.mlp = Inkling2LayerMoE(
++            config,
++            config.layer_visit_ids(layer_id),
++            quant_format=quant_config.expert_format(layer_id),
++        )
+         self.attn_sconv, self.mlp_sconv = (
+             Inkling2ShortConv(
+                 config.hidden_size, config.sconv_kernel_size, self.conv_state, stream
+@@ -168,11 +222,20 @@ class Inkling2DecoderLayer(nn.Module):
+         positions: torch.Tensor,
+         inputs: Sequence[torch.Tensor],
+         tau: torch.Tensor | None,
++        pass_idx: int = 0,
+     ) -> torch.Tensor:
+-        """This rank's partial attention output on the normalized `inputs`."""
+-        if self.is_local:
+-            return self.attn(positions, inputs[0])
+-        return self.attn(positions, inputs[0], inputs[1], inputs[2], tau)
++        """This rank's partial attention output on the normalized `inputs`
++        (one for local layers, or separate q/k/v inputs)."""
++        if self.is_local and len(inputs) == 1:
++            return self.attn(positions, inputs[0], pass_idx=pass_idx)
++        return self.attn(
++            positions,
++            inputs[0],
++            inputs[1],
++            inputs[2],
++            None if self.is_local else tau,
++            pass_idx,
++        )
+ 
+ 
+ class Inkling2Model(nn.Module):
+@@ -193,7 +256,7 @@ class Inkling2Model(nn.Module):
+             config.hidden_size, config.rms_norm_eps, out_dtype=None
+         )
+         self.layers = nn.ModuleList(
+-            Inkling2DecoderLayer(config, i, quant_config, f"{prefix}.layers.{i}")
++            self._make_layer(config, i, quant_config, f"{prefix}.layers.{i}")
+             for i in range(config.num_hidden_layers)
+         )
+         self.attn_res = Inkling2AttnRes(config)
+@@ -202,6 +265,22 @@ class Inkling2Model(nn.Module):
+         # id num_hidden_layers stands for the final-norm output.
+         self.aux_hidden_state_layers: tuple[int, ...] = ()
+ 
++    def _make_layer(
++        self,
++        config: Inkling2ModelConfig,
++        layer_id: int,
++        quant_config: Inkling2QuantConfig | None,
++        prefix: str,
++    ) -> Inkling2DecoderLayer:
++        return Inkling2DecoderLayer(config, layer_id, quant_config, prefix)
++
++    def _log_scaling_tau(self, positions: torch.Tensor) -> torch.Tensor | None:
++        if self.config.log_scaling_n_floor is None:
++            return None
++        return compute_log_scaling_tau(
++            positions, self.config.log_scaling_n_floor, self.config.log_scaling_alpha
++        )
++
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+         return self.embed_norm(self.embed_tokens(input_ids))
+ 
+@@ -229,13 +308,7 @@ class Inkling2Model(nn.Module):
+         stack = inputs_embeds.new_empty((max_blocks + 1, num_tokens, hidden))
+         stack[0].copy_(inputs_embeds)
+         num_blocks = 0
+-        tau = None
+-        if self.config.log_scaling_n_floor is not None:
+-            tau = compute_log_scaling_tau(
+-                positions,
+-                self.config.log_scaling_n_floor,
+-                self.config.log_scaling_alpha,
+-            )
++        tau = self._log_scaling_tau(positions)
+         for i, layer in enumerate(self.layers):
+             partial = stack[num_blocks]
+             if i in self.aux_hidden_state_layers:
+@@ -325,12 +398,14 @@ class Inkling2ForConditionalGeneration(
+         quant_config = vllm_config.quant_config
+         assert quant_config is None or isinstance(quant_config, Inkling2QuantConfig)
+         assert vllm_config.parallel_config.pipeline_parallel_size == 1
+-        from vllm.platforms.rocm import on_gfx950
++        from vllm.platforms.rocm import on_gfx12x, on_gfx950
+ 
+-        if not on_gfx950():
++        # gfx12x (RDNA4) is being brought up (Inkling-2-Mini on R9700); its
++        # kernels are not validated yet.
++        if not (on_gfx950() or on_gfx12x()):
+             raise ValueError(
+-                "Inkling2 on ROCm requires gfx950 (CDNA4, MI350 series): its "
+-                "kernels are written and validated for that architecture only"
++                "Inkling2 on ROCm requires gfx950 (CDNA4, MI350 series) or gfx12x "
++                "(RDNA4): its kernels are written for those architectures only"
+             )
+         if vllm_config.model_config.enable_prompt_embeds:
+             # The reference applies embed_norm to raw input embeddings, which
+@@ -345,7 +420,12 @@ class Inkling2ForConditionalGeneration(
+             and vllm_config.model_config.multimodal_config.get_limit_per_prompt("image")
+             else None
+         )
+-        self.model = Inkling2Model(text_config, quant_config, f"{prefix}model")
++        model_cls: type[Inkling2Model] = Inkling2Model
++        if text_config.loop_config is not None:
++            from .loop import Inkling2LoopModel
++
++            model_cls = Inkling2LoopModel
++        self.model = model_cls(text_config, quant_config, f"{prefix}model")
+         self.lm_head = ParallelLMHead(
+             text_config.padded_vocab_size, text_config.hidden_size
+         )
+diff --git a/vllm/models/inkling2/amd/moe.py b/vllm/models/inkling2/amd/moe.py
+index aa0b9de236..92ba05a803 100644
+--- a/vllm/models/inkling2/amd/moe.py
++++ b/vllm/models/inkling2/amd/moe.py
+@@ -1,11 +1,14 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Inkling2 mixture-of-experts layer (routed experts only, MXFP8).
++"""Inkling2 mixture-of-experts layer (routed experts only, NVFP4 or MXFP8).
+ 
+ Experts are sharded contiguously over the TP group (EP size = TP size); each
+ rank returns the full all-reduced bf16 output. Checkpoint names under
+ `model.llm.layers.N.mlp` map 1:1 to parameters, kept in the checkpoint's
+-layout.
++layout (no row shuffle or scale swizzle in either format).
++
++NVFP4 experts run on `ops.nvfp4_moe.bmm` (fp16 WMMA on in-register decoded
++weights), MXFP8 experts on `ops.triton_bmm.bmm`; both are graph-capturable.
+ """
+ 
+ import torch
+@@ -21,9 +24,10 @@ from vllm.forward_context import get_forward_context, is_forward_context_availab
+ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+ from vllm.model_executor.utils import set_weight_attrs
+ 
+-from .ops import triton_bmm
++from .ops import nvfp4_moe, triton_bmm
+ from .ops.activation import swiglu_quantize
+ from .ops.moe import NUM_COUNTERS, combine, route
++from .quant_config import QuantFormat
+ 
+ 
+ class Inkling2Gate(nn.Module):
+@@ -49,8 +53,12 @@ class Inkling2Gate(nn.Module):
+ 
+ 
+ class Inkling2Experts(nn.Module):
+-    def __init__(self, config) -> None:
++    def __init__(self, config, quant_format: QuantFormat = "mxfp8") -> None:
+         super().__init__()
++        if quant_format not in ("nvfp4", "mxfp8"):
++            raise ValueError(f"Unsupported Inkling2 expert format: {quant_format}")
++        self.quant_format = quant_format
++        self.nvfp4 = quant_format == "nvfp4"
+         self.ep_rank = get_tensor_model_parallel_rank()
+         self.ep_size = get_tensor_model_parallel_world_size()
+         assert config.n_routed_experts % self.ep_size == 0
+@@ -60,9 +68,22 @@ class Inkling2Experts(nn.Module):
+         self.up_cap = config.mlp_up_softcap
+         hidden, inter = config.hidden_size, config.intermediate_size
+         self.hidden_size, self.intermediate_size = hidden, inter
++        # NVFP4: two e2m1 codes per byte, e4m3 scales per 16, per-expert amax
++        # and a per-tensor denominator; MXFP8: e4m3, ue8m0 scales per 32.
++        pack, group = (2, 16) if self.nvfp4 else (1, 32)
++        weight_dtype = torch.uint8 if self.nvfp4 else torch.float8_e4m3fn
++        scale_dtype = torch.float8_e4m3fn if self.nvfp4 else torch.uint8
+         for name, (n, k) in (("w13", (2 * inter, hidden)), ("w2", (hidden, inter))):
+-            self._register(f"{name}_weight", (n, k), torch.float8_e4m3fn)
+-            self._register(f"{name}_weight_scale", (n, k // 32), torch.uint8)
++            self._register(f"{name}_weight", (n, k // pack), weight_dtype)
++            self._register(f"{name}_weight_scale", (n, k // group), scale_dtype)
++            if self.nvfp4:
++                self._register(f"{name}_weight_amax", (), torch.float32)
++                self._register(
++                    f"{name}_weight_outer_scale_denominator",
++                    (1,),
++                    torch.float32,
++                    per_expert=False,
++                )
+ 
+         start = self.ep_rank * self.num_experts
+         self.register_buffer(
+@@ -75,16 +96,27 @@ class Inkling2Experts(nn.Module):
+             "counts", torch.zeros(self.num_experts, dtype=torch.int32), persistent=False
+         )
+ 
+-    def _register(self, name: str, shape: tuple[int, ...], dtype: torch.dtype) -> None:
+-        param = nn.Parameter(
+-            torch.empty((self.num_experts, *shape), dtype=dtype), requires_grad=False
+-        )
+-        set_weight_attrs(param, {"weight_loader": self._load_expert_shard})
++    def _register(
++        self,
++        name: str,
++        shape: tuple[int, ...],
++        dtype: torch.dtype,
++        per_expert: bool = True,
++    ) -> None:
++        if per_expert:
++            shape = (self.num_experts, *shape)
++        param = nn.Parameter(torch.empty(shape, dtype=dtype), requires_grad=False)
++        loader = self._load_expert_shard if per_expert else self._load_full
++        set_weight_attrs(param, {"weight_loader": loader})
+         self.register_parameter(name, param)
+ 
+     def _load_expert_shard(self, param: nn.Parameter, loaded: torch.Tensor) -> None:
+         start = self.ep_rank * self.num_experts
+-        loaded = loaded[start : start + self.num_experts]
++        self._load_full(param, loaded[start : start + self.num_experts])
++
++    @staticmethod
++    def _load_full(param: nn.Parameter, loaded: torch.Tensor) -> None:
++        # Copied as stored: no row shuffle, no scale swizzle.
+         assert loaded.shape == param.shape and loaded.dtype == param.dtype, (
+             f"{loaded.shape} {loaded.dtype} != {param.shape} {param.dtype}"
+         )
+@@ -95,6 +127,17 @@ class Inkling2Experts(nn.Module):
+ 
+     def _gemm(self, quantized, name: str, tiles, plan) -> torch.Tensor:
+         act, act_scale = quantized
++        if self.nvfp4:
++            return nvfp4_moe.bmm(
++                act,
++                act_scale,
++                getattr(self, f"{name}_weight"),
++                getattr(self, f"{name}_weight_scale"),
++                getattr(self, f"{name}_weight_amax"),
++                getattr(self, f"{name}_weight_outer_scale_denominator"),
++                tiles,
++                plan,
++            )
+         return triton_bmm.bmm(
+             act,
+             act_scale,
+@@ -128,11 +171,12 @@ class Inkling2Experts(nn.Module):
+ 
+ 
+ class Inkling2MoE(nn.Module):
+-    def __init__(self, config) -> None:
++    def __init__(self, config, quant_format: QuantFormat = "mxfp8") -> None:
++        """`quant_format`: the layer's `Inkling2QuantConfig.expert_format`."""
+         super().__init__()
+         assert config.n_shared_experts == 0
+         self.gate = Inkling2Gate(config)
+-        self.experts = Inkling2Experts(config)
++        self.experts = Inkling2Experts(config, quant_format)
+ 
+     def forward(self, x: torch.Tensor) -> torch.Tensor:
+         """bf16 [T, H] -> bf16 [T, H], reduced over the expert-parallel group.
+diff --git a/vllm/models/inkling2/amd/ops/activation.py b/vllm/models/inkling2/amd/ops/activation.py
+index 21c1bc36cc..59cb807b11 100644
+--- a/vllm/models/inkling2/amd/ops/activation.py
++++ b/vllm/models/inkling2/amd/ops/activation.py
+@@ -131,9 +131,10 @@ def swiglu_quantize(
+     routed, num_routed = rows
+     max_rows = routed.numel()
+     if max_rows <= 512:
+-        # Few rows: a program per 256 columns.
+-        assert n % 256 == 0
+-        head, tail = 256, 0
++        # Few rows: a program per 256 columns (128 for Inkling-2-Mini's
++        # 1152-wide experts): the largest power of two up to 256 dividing n.
++        head, tail = min(256, n & -n), 0
++        assert head >= 32
+     else:
+         # Whole rows, as a power-of-two head and tail.
+         head = 1 << (n.bit_length() - 1)
+diff --git a/vllm/models/inkling2/amd/ops/attention.py b/vllm/models/inkling2/amd/ops/attention.py
+index 62b9aef0f0..3498504479 100644
+--- a/vllm/models/inkling2/amd/ops/attention.py
++++ b/vllm/models/inkling2/amd/ops/attention.py
+@@ -7,24 +7,84 @@ A relative attention program owns `BLOCK_Q` query tokens of one request and
+ the query heads of one KV head (rows token-major), and walks the request's
+ keys from its first query's window (local layers) or the start (full layers)
+ to its last query. Decode and verify batches split those keys over several
+-programs (split-KV) and merge the partial outputs in a second launch.
++programs (split-KV) and merge the partial outputs in a second launch. On
++gfx12, prefill launches take `_rel_prefill_kernel`: the same math with the
++GQA group packed without padding rows, unmasked steps over the keys that
++every row sees without a relative logit, and FP8 KV decoded with integer
++ops.
+ """
+ 
++import functools
++from dataclasses import dataclass
++
+ import torch
+ 
+ from vllm.triton_utils import tl, tldevice, triton
+ from vllm.utils.platform_utils import num_compute_units
+ 
++from .nvfp4_moe import _e4m3_to_f16
++
+ _LOG2E = 1.4426950408889634
+ _BLOCK_N = 64
+ # Query rows (tokens x GQA group, padded to a power of two) of a split-KV
+ # program, which holds all queries of a request.
+ _DECODE_BLOCK_M = 64
+-# Split-KV programs per compute unit that a decode batch launches, and the
+-# most splits of a request and KV head (fitted on MI355X at TP4, for 1 to
+-# 256 requests of 1 and 8 queries over 1K to 100K keys).
+-_SPLIT_PROGRAMS_PER_CU = 2
+-_MAX_SPLITS = 128
++
++
++@dataclass(frozen=True)
++class DecodeConfig:
++    """Split-KV decode tuning of one GPU architecture."""
++
++    # Split-KV programs per compute unit that a decode batch launches, and
++    # the most splits of a request and KV head (full layers).
++    programs_per_cu: int
++    max_splits: int
++    # Launch parameters of the split-KV programs (keys per iteration).
++    block_n: int
++    num_warps: int
++    num_stages: int
++
++
++# Fitted on MI355X (gfx950, 256 CUs, wave64) at TP4, for 1 to 256 requests of
++# 1 and 8 queries over 1K to 100K keys.
++_GFX950_DECODE = DecodeConfig(
++    programs_per_cu=2, max_splits=128, block_n=64, num_warps=4, num_stages=1
++)
++# Fitted on the Radeon AI PRO R9700 (gfx1201: 64 CUs, which torch reports as
++# 32 multiprocessors, wave32, 64 KiB LDS) for one request of 1, 4 and 8
++# queries over 1K to 196K keys at Inkling-2-Mini's 24 / 8 heads: 16 splits of
++# 32-key blocks are within 1% of the best of block_n 32/64/128, 2/4/8 warps,
++# 1/2 stages and 8 to 128 splits on full layers (the gfx950 values, 8 splits
++# of 64 keys, are up to 9% slower) and within 15% on windows; 128 keys x 2
++# stages exceed the LDS.
++_GFX12_DECODE = DecodeConfig(
++    programs_per_cu=4, max_splits=128, block_n=32, num_warps=4, num_stages=1
++)
++
++
++@functools.cache
++def _use_prefill_kernel() -> bool:
++    """`_rel_prefill_kernel` (tuned on gfx12) for prefill launches."""
++    from vllm.platforms import current_platform
++
++    if not current_platform.is_rocm():
++        return False
++    from vllm.platforms.rocm import on_gfx12x
++
++    return on_gfx12x()
++
++
++@functools.cache
++def decode_config() -> DecodeConfig:
++    """The split-KV decode tuning of the current GPU."""
++    from vllm.platforms import current_platform
++
++    if current_platform.is_rocm():
++        from vllm.platforms.rocm import on_gfx12x
++
++        if on_gfx12x():
++            return _GFX12_DECODE
++    return _GFX950_DECODE
+ 
+ 
+ @triton.jit(do_not_specialize=["num_splits", "num_tokens"])
+@@ -137,7 +197,7 @@ def _rel_attention_kernel(
+             + d[None, :],
+             key_valid[:, None],
+             other=0.0,
+-        )
++        ).to(q.dtype)  # unit-scale FP8 KV is upcast to the query dtype
+         s = tl.dot(q, tl.trans(k)) * scale_log2
+         dist = pos[:, None] - keys[None, :]
+         valid = row_valid[:, None] & key_valid[None, :] & (dist >= 0)
+@@ -164,7 +224,7 @@ def _rel_attention_kernel(
+             + d[None, :],
+             key_valid[:, None],
+             other=0.0,
+-        )
++        ).to(q.dtype)
+         acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+         m_i = m_new
+ 
+@@ -183,6 +243,253 @@ def _rel_attention_kernel(
+         tl.store(Lse + head * stride_lh + out_token, lse, row_valid)
+ 
+ 
++@triton.jit
++def _load_kv(ptrs, mask, dtype: tl.constexpr, D: tl.constexpr, MASKED: tl.constexpr):
++    """[BLOCK_N, D] keys or values at `ptrs` (row starts) in `dtype`. FP8
++    (unit-scale e4m3) caches are read as byte pairs and decoded exactly
++    with integer ops (2^-8 times the value in fp16, then fp32 times 2^8,
++    truncated to bf16), much faster on gfx12 than Triton's conversions."""
++    if ptrs.dtype.element_ty == tl.float8e4nv:
++        pairs = (
++            ptrs.to(tl.pointer_type(tl.uint16))[:, None] + tl.arange(0, D // 2)[None, :]
++        )
++        x = tl.load(pairs, mask[:, None], other=0) if MASKED else tl.load(pairs)
++        f32 = _e4m3_to_f16(x, ptrs.shape[0], D // 2).to(tl.float32) * 256.0
++        if dtype == tl.bfloat16:
++            # Exact in bf16 (4 significant bits): truncate, no rounding.
++            bits = f32.to(tl.uint32, bitcast=True) >> 16
++            return bits.to(tl.uint16).to(tl.bfloat16, bitcast=True)
++        return f32.to(dtype)
++    d = tl.arange(0, D)
++    if MASKED:
++        return tl.load(ptrs[:, None] + d[None, :], mask[:, None], other=0.0).to(dtype)
++    return tl.load(ptrs[:, None] + d[None, :]).to(dtype)
++
++
++@triton.jit
++def _attend_block(
++    q,
++    K,
++    V,
++    table,
++    keys,
++    kv_head,
++    m_i,
++    l_i,
++    acc,
++    scale_log2,
++    bias_rows,
++    pos,
++    row_valid,
++    key0,
++    hi,
++    stride_kb,
++    stride_kp,
++    stride_kh,
++    stride_vb,
++    stride_vp,
++    stride_vh,
++    D: tl.constexpr,
++    PAGE: tl.constexpr,
++    WINDOW: tl.constexpr,
++    MASKED: tl.constexpr,
++):
++    """One online-softmax step of a prefill program over the key block
++    `keys`. Without `MASKED`, every key is visible to every row and has no
++    relative logit (and is below `hi`)."""
++    key_valid = keys < hi
++    if MASKED:
++        page = tl.load(table + keys // PAGE, key_valid, other=0).to(tl.int64)
++    else:
++        page = tl.load(table + keys // PAGE).to(tl.int64)
++    slot = keys % PAGE
++    k_rows = K + page * stride_kb + slot * stride_kp + kv_head * stride_kh
++    v_rows = V + page * stride_vb + slot * stride_vp + kv_head * stride_vh
++    k = _load_kv(k_rows, key_valid, q.dtype, D, MASKED)
++    s = tl.dot(q, tl.trans(k)) * scale_log2
++    if MASKED:
++        dist = pos[:, None] - keys[None, :]
++        valid = row_valid[:, None] & key_valid[None, :] & (dist >= 0)
++        if WINDOW >= 0:
++            valid &= dist <= WINDOW
++        # Keys before key0 are past the extent: no bias (full layers) or
++        # out of the window.
++        in_table = valid & (keys[None, :] >= key0[:, None])
++        bias = tl.load(bias_rows[:, None] + keys[None, :], in_table, other=0.0)
++        s = s + bias.to(tl.float32) * 1.4426950408889634
++        s = tl.where(valid, s, float("-inf"))
++    m_new = tl.maximum(m_i, tl.max(s, 1))
++    # Rows without a live key so far keep m = -inf: no -inf - -inf.
++    m_ref = tl.where(m_new == float("-inf"), 0.0, m_new)
++    alpha = tl.math.exp2(m_i - m_ref)
++    p = tl.math.exp2(s - m_ref[:, None])
++    l_i = l_i * alpha + tl.sum(p, 1)
++    v = _load_kv(v_rows, key_valid, q.dtype, D, MASKED)
++    if v.dtype == tl.bfloat16:
++        # Round to nearest even like `.to(tl.bfloat16)`, without its NaN
++        # case (p is finite): fewer integer ops on gfx12.
++        bits = p.to(tl.uint32, bitcast=True)
++        bits = (bits + (0x7FFF + ((bits >> 16) & 1))) >> 16
++        p_mma = bits.to(tl.uint16).to(tl.bfloat16, bitcast=True)
++    else:
++        p_mma = p.to(v.dtype)
++    acc = acc * alpha[:, None] + tl.dot(p_mma, v)
++    return m_new, l_i, acc
++
++
++@triton.jit
++def _rel_prefill_kernel(
++    Q,
++    K,
++    V,
++    Bias,
++    Out,
++    Lse,
++    BlockTable,
++    SeqLens,
++    CuSeqlensQ,
++    scale_log2,
++    stride_qt,
++    stride_qh,
++    stride_kb,
++    stride_kp,
++    stride_kh,
++    stride_vb,
++    stride_vp,
++    stride_vh,
++    stride_bt,
++    stride_bh,
++    stride_ot,
++    stride_oh,
++    stride_lh,
++    stride_table,
++    GROUP: tl.constexpr,
++    D: tl.constexpr,
++    PAGE: tl.constexpr,
++    E_PAD: tl.constexpr,
++    WINDOW: tl.constexpr,
++    BLOCK_M: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++):
++    # `_rel_attention_kernel` (not split, not draft) for prefill chunks. A
++    # program owns BLOCK_M // GROUP query tokens of one request and the GROUP
++    # query heads of one KV head (row r: token r // GROUP, head r % GROUP),
++    # so no rows are padding when GROUP is not a power of two. Key blocks
++    # that every row sees and that are before every row's relative-logit
++    # table (full layers: all but the last E_PAD + BLOCK_M // GROUP keys)
++    # take an unmasked step without the bias; the rest the masked one.
++    BLOCK_Q: tl.constexpr = BLOCK_M // GROUP
++    kv_head = tl.program_id(1)
++    req = tl.program_id(2)
++    q_start = tl.load(CuSeqlensQ + req)
++    q_len = tl.load(CuSeqlensQ + req + 1) - q_start
++    q0 = tl.program_id(0) * BLOCK_Q
++    if q0 >= q_len:
++        return
++    seq_len = tl.load(SeqLens + req)
++    past = seq_len - q_len
++
++    rows = tl.arange(0, BLOCK_M)
++    q_idx = q0 + rows // GROUP
++    head = kv_head * GROUP + rows % GROUP
++    row_valid = (q_idx < q_len) & (rows < BLOCK_Q * GROUP)
++    token = (q_start + q_idx).to(tl.int64)
++    d = tl.arange(0, D)
++    q = tl.load(
++        Q + token[:, None] * stride_qt + head[:, None] * stride_qh + d[None, :],
++        row_valid[:, None],
++        other=0.0,
++    )
++    pos = past + q_idx
++    first_pos = past + q0
++    hi = tl.minimum(past + q0 + BLOCK_Q, seq_len)
++    # Sheared column of key j is j - key0: key0 starts the E_PAD keys
++    # ending at the key blocks of the token's 128-token query tile.
++    tile_end = tl.minimum((q_idx // 128 + 1) * 128, q_len)
++    key0 = tl.cdiv(past + tile_end, 128) * 128 - E_PAD
++    bias_rows = Bias + token * stride_bt + head * stride_bh - key0
++    table = BlockTable + req * stride_table
++    m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
++    l_i = tl.zeros([BLOCK_M], tl.float32)
++    acc = tl.zeros([BLOCK_M, D], tl.float32)
++    if WINDOW >= 0:
++        lo = tl.maximum(first_pos - WINDOW, 0) // BLOCK_N * BLOCK_N
++        far_end = lo
++    else:
++        lo = 0
++        # The first row has the smallest key0 (and position).
++        first_end = tl.minimum((q0 // 128 + 1) * 128, q_len)
++        key0_min = tl.cdiv(past + first_end, 128) * 128 - E_PAD
++        far_end = tl.maximum(tl.minimum(key0_min, first_pos + 1), 0)
++        far_end = far_end // BLOCK_N * BLOCK_N
++    for start in range(lo, far_end, BLOCK_N):
++        m_i, l_i, acc = _attend_block(
++            q,
++            K,
++            V,
++            table,
++            start + tl.arange(0, BLOCK_N),
++            kv_head,
++            m_i,
++            l_i,
++            acc,
++            scale_log2,
++            bias_rows,
++            pos,
++            row_valid,
++            key0,
++            hi,
++            stride_kb,
++            stride_kp,
++            stride_kh,
++            stride_vb,
++            stride_vp,
++            stride_vh,
++            D,
++            PAGE,
++            WINDOW,
++            False,
++        )
++    for start in range(far_end, hi, BLOCK_N):
++        m_i, l_i, acc = _attend_block(
++            q,
++            K,
++            V,
++            table,
++            start + tl.arange(0, BLOCK_N),
++            kv_head,
++            m_i,
++            l_i,
++            acc,
++            scale_log2,
++            bias_rows,
++            pos,
++            row_valid,
++            key0,
++            hi,
++            stride_kb,
++            stride_kp,
++            stride_kh,
++            stride_vb,
++            stride_vp,
++            stride_vh,
++            D,
++            PAGE,
++            WINDOW,
++            True,
++        )
++
++    has_keys = l_i > 0.0
++    out = acc / tl.where(has_keys, l_i, 1.0)[:, None]
++    tl.store(
++        Out + token[:, None] * stride_ot + head[:, None] * stride_oh + d[None, :],
++        out.to(Out.dtype.element_ty),
++        row_valid[:, None],
++    )
++    lse = tl.where(has_keys, m_i + tl.math.log2(l_i), float("-inf"))
++    tl.store(Lse + head * stride_lh + token, lse * 0.6931471805599453, row_valid)
++
++
+ def rel_attention(
+     q: torch.Tensor,
+     key_cache: torch.Tensor,
+@@ -290,11 +597,12 @@ def plan_decode_attention(
+         return 0
+     work = max(1, num_reqs * num_kv_heads)
+     num_cus = num_compute_units()
+-    max_splits = _MAX_SPLITS
++    cfg = decode_config()
++    max_splits = cfg.max_splits
+     if is_local:
+         # One key block of the window per split, at most.
+-        max_splits = triton.cdiv(rel_extent - 1, _BLOCK_N) + 1
+-    return max(1, min(max_splits, _SPLIT_PROGRAMS_PER_CU * num_cus // work))
++        max_splits = triton.cdiv(rel_extent - 1, cfg.block_n) + 1
++    return max(1, min(max_splits, cfg.programs_per_cu * num_cus // work))
+ 
+ 
+ def rel_decode_attention(
+@@ -429,7 +737,10 @@ def _launch(
+     block_q = max(1, block_m // block_h)
+     num_reqs = cache_seqlens.shape[0]
+     split = out is None or lse is None
++    block_n, num_warps, num_stages = _BLOCK_N, (4 if block_m <= 64 else 8), 1
+     if split:
++        cfg = decode_config()
++        block_n, num_warps, num_stages = cfg.block_n, cfg.num_warps, cfg.num_stages
+         assert max_seqlen_q <= block_q and num_splits > 0
+         out = q.new_empty((num_splits * num_tokens, *q.shape[1:]), dtype=torch.float32)
+         lse = q.new_empty((num_heads, num_splits * num_tokens), dtype=torch.float32)
+@@ -440,6 +751,22 @@ def _launch(
+     assert out.stride(2) == 1
+     if num_tokens == 0:
+         return out, lse
++    if not split and not draft and _use_prefill_kernel():
++        _launch_prefill(
++            q,
++            key_cache,
++            value_cache,
++            bias,
++            out,
++            lse,
++            block_table,
++            cache_seqlens,
++            cu_seqlens_q,
++            max_seqlen_q,
++            softmax_scale,
++            window,
++        )
++        return out, lse
+     _rel_attention_kernel[grid](
+         q,
+         key_cache,
+@@ -476,13 +803,90 @@ def _launch(
+         SPLIT=split,
+         BLOCK_Q=block_q,
+         BLOCK_H=block_h,
+-        BLOCK_N=_BLOCK_N,
+-        num_warps=4 if block_m <= 64 else 8,
+-        num_stages=1,
++        BLOCK_N=block_n,
++        num_warps=num_warps,
++        num_stages=num_stages,
+     )
+     return out, lse
+ 
+ 
++def _prefill_config(
++    max_seqlen_q: int, group: int, window: int, fp8: bool
++) -> tuple[int, int, int, int]:
++    """(BLOCK_M, BLOCK_N, num_warps, num_stages) of `_rel_prefill_kernel`,
++    fitted on the R9700 (gfx1201) for 2048-query chunks after 0 to 62K keys:
++    6.2x the speed of `_rel_attention_kernel` at 62K keys with FP8 KV, 2.3x
++    at 16K with BF16."""
++    block_m = min(64, max(16, triton.next_power_of_2(max_seqlen_q * group)))
++    if window >= 0:
++        return block_m, 32, 4, 1
++    # Full layers: FP8 KV (decoded in registers) wants two stages of short
++    # key blocks, BF16 KV one stage of 64-key blocks.
++    return (block_m, 32, 4, 2) if fp8 else (block_m, 64, 4, 1)
++
++
++def _launch_prefill(
++    q: torch.Tensor,
++    key_cache: torch.Tensor,
++    value_cache: torch.Tensor,
++    bias: torch.Tensor,
++    out: torch.Tensor,
++    lse: torch.Tensor,
++    block_table: torch.Tensor,
++    cache_seqlens: torch.Tensor,
++    cu_seqlens_q: torch.Tensor,
++    max_seqlen_q: int,
++    softmax_scale: float,
++    window: int,
++) -> None:
++    num_heads, head_dim = q.shape[1:]
++    page, num_kv_heads = key_cache.shape[1:3]
++    group = num_heads // num_kv_heads
++    block_m, block_n, num_warps, num_stages = _prefill_config(
++        max_seqlen_q, group, window, key_cache.dtype == torch.float8_e4m3fn
++    )
++    grid = (
++        triton.cdiv(max_seqlen_q, block_m // group),
++        num_kv_heads,
++        cache_seqlens.shape[0],
++    )
++    _rel_prefill_kernel[grid](
++        q,
++        key_cache,
++        value_cache,
++        bias,
++        out,
++        lse,
++        block_table,
++        cache_seqlens,
++        cu_seqlens_q,
++        softmax_scale * _LOG2E,
++        q.stride(0),
++        q.stride(1),
++        key_cache.stride(0),
++        key_cache.stride(1),
++        key_cache.stride(2),
++        value_cache.stride(0),
++        value_cache.stride(1),
++        value_cache.stride(2),
++        bias.stride(0),
++        bias.stride(1),
++        out.stride(0),
++        out.stride(1),
++        lse.stride(0),
++        block_table.stride(0),
++        GROUP=group,
++        D=head_dim,
++        PAGE=page,
++        E_PAD=bias.shape[2],
++        WINDOW=window,
++        BLOCK_M=block_m,
++        BLOCK_N=block_n,
++        num_warps=num_warps,
++        num_stages=num_stages,
++    )
++
++
+ @triton.jit(do_not_specialize=["num_reqs", "num_splits", "num_tokens"])
+ def _split_combine_kernel(
+     OPart,
+diff --git a/vllm/models/inkling2/amd/ops/attn_res.py b/vllm/models/inkling2/amd/ops/attn_res.py
+index a8d139dbc8..e70702f6f6 100644
+--- a/vllm/models/inkling2/amd/ops/attn_res.py
++++ b/vllm/models/inkling2/amd/ops/attn_res.py
+@@ -6,7 +6,8 @@ For each token, sources `x_n` (stored blocks, then the partial block plus an
+ optional addend, all in fp32) are scored as `(q . x_n) * rsqrt(mean(x_n^2) +
+ eps)` per pseudo-query `q`; the output is `sum_n softmax_n * x_n`, with
+ `x_n` RMS-normalized when `normalize_values` is set. The fp32 mix then
+-goes through the following sublayer's RMSNorm in the same kernel.
++goes through the following sublayer's RMSNorm in the same kernel, or is
++returned as is (fp32) without a norm weight.
+ """
+ 
+ import torch
+@@ -16,11 +17,29 @@ from vllm.triton_utils import tl, tldevice, triton
+ 
+ @triton.jit
+ def _load_source(
+-    Stack, stride_s, Last, Addend, row_off, offs, mask, n, N_STACK, HAS_ADDEND
++    Stack,
++    stride_s,
++    Last,
++    Addend,
++    row_off,
++    offs,
++    mask,
++    n,
++    N_STACK,
++    HAS_ADDEND,
++    LAST_CG: tl.constexpr = False,
+ ):
++    # LAST_CG: `Last` / `Addend` were just written by this program (the fused
++    # conv + mix), so read them past the per-CU cache.
+     if n < N_STACK:
+         x = tl.load(Stack + n * stride_s + row_off + offs, mask, other=0)
+         x = x.to(tl.float32)
++    elif LAST_CG:
++        x = tl.load(Last + row_off + offs, mask, other=0, cache_modifier=".cg")
++        x = x.to(tl.float32)
++        if HAS_ADDEND:
++            a = tl.load(Addend + row_off + offs, mask, other=0, cache_modifier=".cg")
++            x = x + a.to(tl.float32)
+     else:
+         x = tl.load(Last + row_off + offs, mask, other=0).to(tl.float32)
+         if HAS_ADDEND:
+@@ -68,6 +87,7 @@ def _attn_res_kernel(
+     N_STACK: tl.constexpr,
+     HAS_ADDEND: tl.constexpr,
+     NORMALIZE: tl.constexpr,
++    APPLY_NORM: tl.constexpr,
+     BLOCK_N: tl.constexpr,
+     BLOCK_D: tl.constexpr,
+ ):
+@@ -112,28 +132,30 @@ def _attn_res_kernel(
+         probs = probs * inv_rms
+ 
+     # Pass 2: RMS of the probability-weighted sum; pass 3: normalized sum.
+-    sum_sq = 0.0
+-    for d0 in tl.range(0, D, BLOCK_D):
+-        offs = d0 + d_idx
+-        acc = (
+-            _mix(
+-                Stack,
+-                stride_s,
+-                Last,
+-                Addend,
+-                row_off,
+-                offs,
+-                offs < D,
+-                probs,
+-                n_idx,
+-                N_STACK,
+-                HAS_ADDEND,
+-                BLOCK_D,
++    out_rstd = 1.0
++    if APPLY_NORM:
++        sum_sq = 0.0
++        for d0 in tl.range(0, D, BLOCK_D):
++            offs = d0 + d_idx
++            acc = (
++                _mix(
++                    Stack,
++                    stride_s,
++                    Last,
++                    Addend,
++                    row_off,
++                    offs,
++                    offs < D,
++                    probs,
++                    n_idx,
++                    N_STACK,
++                    HAS_ADDEND,
++                    BLOCK_D,
++                )
++                * inv_sum
+             )
+-            * inv_sum
+-        )
+-        sum_sq += tl.sum(acc * acc)
+-    out_rstd = tl.rsqrt(tl.div_rn(sum_sq, D) + norm_eps)
++            sum_sq += tl.sum(acc * acc)
++        out_rstd = tl.rsqrt(tl.div_rn(sum_sq, D) + norm_eps)
+     out = Out + tl.program_id(0).to(tl.int64) * T * D + row_off
+     for d0 in tl.range(0, D, BLOCK_D):
+         offs = d0 + d_idx
+@@ -155,13 +177,14 @@ def _attn_res_kernel(
+             )
+             * inv_sum
+         )
+-        w = tl.load(NormW + q_off + offs, mask, other=0).to(tl.float32)
+-        acc = acc * out_rstd * w
++        if APPLY_NORM:
++            w = tl.load(NormW + q_off + offs, mask, other=0).to(tl.float32)
++            acc = acc * out_rstd * w
+         tl.store(out + offs, acc.to(Out.dtype.element_ty), mask)
+ 
+ 
+ @triton.jit
+-def _attn_res_row_kernel(
++def _row_mix(
+     Stack,
+     Last,
+     Addend,
+@@ -172,19 +195,22 @@ def _attn_res_row_kernel(
+     T,
+     eps,
+     norm_eps,
++    t,
++    q,
+     D: tl.constexpr,
+     N_STACK: tl.constexpr,
+     HAS_ADDEND: tl.constexpr,
+     NORMALIZE: tl.constexpr,
++    APPLY_NORM: tl.constexpr,
+     BLOCK_N: tl.constexpr,
+     BLOCK_A: tl.constexpr,
+     BLOCK_B: tl.constexpr,
++    LAST_CG: tl.constexpr = False,
+ ):
+-    # Small batches: one program per (token, query) holds the row in registers
+-    # as a power-of-2 head [0, BLOCK_A) and a masked tail [BLOCK_A, D), so the
+-    # sources are read twice instead of three times.
+-    t = tl.program_id(1).to(tl.int64)
+-    q_off = tl.program_id(0) * D
++    """The mix of token `t` with query `q`: the row in registers as a
++    power-of-2 head [0, BLOCK_A) and a masked tail [BLOCK_A, D), so the
++    sources are read twice instead of three times."""
++    q_off = q * D
+     row_off = t * D
+     da = tl.arange(0, BLOCK_A)
+     db = BLOCK_A + tl.arange(0, BLOCK_B)
+@@ -198,8 +224,8 @@ def _attn_res_row_kernel(
+     logits = tl.full((BLOCK_N,), float("-inf"), tl.float32)
+     inv_rms = tl.zeros((BLOCK_N,), tl.float32)
+     for n in tl.static_range(N_STACK + 1):
+-        xa = _load_source(*src, da, mask_a, n, N_STACK, HAS_ADDEND)
+-        xb = _load_source(*src, db, mask_b, n, N_STACK, HAS_ADDEND)
++        xa = _load_source(*src, da, mask_a, n, N_STACK, HAS_ADDEND, LAST_CG)
++        xb = _load_source(*src, db, mask_b, n, N_STACK, HAS_ADDEND, LAST_CG)
+         rstd = tl.rsqrt(tl.fma(tl.sum(xa * xa) + tl.sum(xb * xb), 1.0 / D, eps))
+         inv_rms = tl.where(n_idx == n, rstd, inv_rms)
+         dot = tl.sum(qa * xa) + tl.sum(qb * xb)
+@@ -214,19 +240,78 @@ def _attn_res_row_kernel(
+     acc_b = tl.zeros((BLOCK_B,), tl.float32)
+     for n in tl.static_range(N_STACK + 1):
+         p = tl.sum(tl.where(n_idx == n, probs, 0.0))
+-        xa = _load_source(*src, da, mask_a, n, N_STACK, HAS_ADDEND)
+-        xb = _load_source(*src, db, mask_b, n, N_STACK, HAS_ADDEND)
++        xa = _load_source(*src, da, mask_a, n, N_STACK, HAS_ADDEND, LAST_CG)
++        xb = _load_source(*src, db, mask_b, n, N_STACK, HAS_ADDEND, LAST_CG)
+         acc_a = tl.fma(p, xa, acc_a)
+         acc_b = tl.fma(p, xb, acc_b)
+     acc_a = acc_a * inv_sum
+     acc_b = acc_b * inv_sum
+-    sum_sq = tl.sum(acc_a * acc_a) + tl.sum(acc_b * acc_b)
+-    out_rstd = tl.rsqrt(tl.div_rn(sum_sq, D) + norm_eps)
+-    out = Out + tl.program_id(0).to(tl.int64) * T * D + row_off
+-    wa = tl.load(NormW + q_off + da, mask_a, other=0).to(tl.float32)
+-    wb = tl.load(NormW + q_off + db, mask_b, other=0).to(tl.float32)
+-    tl.store(out + da, (acc_a * out_rstd * wa).to(Out.dtype.element_ty), mask_a)
+-    tl.store(out + db, (acc_b * out_rstd * wb).to(Out.dtype.element_ty), mask_b)
++    out = Out + tl.cast(q, tl.int64) * T * D + row_off
++    if APPLY_NORM:
++        sum_sq = tl.sum(acc_a * acc_a) + tl.sum(acc_b * acc_b)
++        out_rstd = tl.rsqrt(tl.div_rn(sum_sq, D) + norm_eps)
++        wa = tl.load(NormW + q_off + da, mask_a, other=0).to(tl.float32)
++        wb = tl.load(NormW + q_off + db, mask_b, other=0).to(tl.float32)
++        acc_a = acc_a * out_rstd * wa
++        acc_b = acc_b * out_rstd * wb
++    tl.store(out + da, acc_a.to(Out.dtype.element_ty), mask_a)
++    tl.store(out + db, acc_b.to(Out.dtype.element_ty), mask_b)
++
++
++@triton.jit
++def _attn_res_row_kernel(
++    Stack,
++    Last,
++    Addend,
++    Queries,
++    NormW,
++    Out,
++    stride_s,
++    T,
++    eps,
++    norm_eps,
++    D: tl.constexpr,
++    N_STACK: tl.constexpr,
++    HAS_ADDEND: tl.constexpr,
++    NORMALIZE: tl.constexpr,
++    APPLY_NORM: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    BLOCK_A: tl.constexpr,
++    BLOCK_B: tl.constexpr,
++):
++    # Small batches: one program per (token, query).
++    _row_mix(
++        Stack,
++        Last,
++        Addend,
++        Queries,
++        NormW,
++        Out,
++        stride_s,
++        T,
++        eps,
++        norm_eps,
++        tl.program_id(1).to(tl.int64),
++        tl.program_id(0),
++        D,
++        N_STACK,
++        HAS_ADDEND,
++        NORMALIZE,
++        APPLY_NORM,
++        BLOCK_N,
++        BLOCK_A,
++        BLOCK_B,
++    )
++
++
++def row_blocks(d: int) -> tuple[int, int]:
++    """`(BLOCK_A, BLOCK_B)` of the row kernel: a power-of-2 head and tail."""
++    block_a = triton.next_power_of_2(d + 1) // 2
++    return block_a, max(triton.next_power_of_2(d - block_a), 16)
++
++
++# The row kernel serves batches of up to this many (token, query) programs.
++ROW_MAX_PROGRAMS = 256
+ 
+ 
+ def attn_res(
+@@ -234,16 +319,19 @@ def attn_res(
+     last: torch.Tensor,
+     addend: torch.Tensor | None,
+     queries: torch.Tensor,
+-    norm_weight: torch.Tensor,
++    norm_weight: torch.Tensor | None,
+     norm_eps: float,
+     normalize_values: bool,
+     eps: float = 1e-6,
++    select_q: int | None = None,
+ ) -> torch.Tensor:
+     """Mix `[*stack, last (+ addend)]` with each pseudo-query.
+ 
+     `queries` are fp32 `(Q, D)`, already scaled by `D**-0.5`; each fp32
+     mix is RMS-normalized with its row of `norm_weight` `(Q, D)`. Returns
+-    `(Q, T, D)` in `last.dtype`.
++    `(Q, T, D)` in `last.dtype`, or the fp32 mixes without `norm_weight`.
++    `select_q` picks the kernel as for that many queries (a launch batching
++    several mixes keeps their unbatched kernel, hence their rounding).
+     """
+     num_tokens, d = last.shape
+     num_stack = stack.shape[0]
+@@ -253,8 +341,12 @@ def attn_res(
+     assert stack.stride(1) == d and stack.stride(2) == 1
+     if addend is not None:
+         assert addend.is_contiguous() and addend.shape == last.shape
++    apply_norm = norm_weight is not None
++    if norm_weight is None:
++        norm_weight = queries  # unread
+     assert norm_weight.shape == queries.shape and norm_weight.is_contiguous()
+-    out = torch.empty((num_q, num_tokens, d), dtype=last.dtype, device=last.device)
++    out_dtype = last.dtype if apply_norm else torch.float32
++    out = torch.empty((num_q, num_tokens, d), dtype=out_dtype, device=last.device)
+     args = (
+         stack,
+         last,
+@@ -272,14 +364,14 @@ def attn_res(
+         N_STACK=num_stack,
+         HAS_ADDEND=addend is not None,
+         NORMALIZE=normalize_values,
++        APPLY_NORM=apply_norm,
+         BLOCK_N=triton.next_power_of_2(num_stack + 1),
+         enable_fp_fusion=False,
+     )
+     # The queries of a token run back to back and share its sources in L2.
+     grid = (num_q, num_tokens)
+-    if num_tokens * num_q <= 256:
+-        block_a = triton.next_power_of_2(d + 1) // 2
+-        block_b = max(triton.next_power_of_2(d - block_a), 16)
++    if num_tokens * (select_q or num_q) <= ROW_MAX_PROGRAMS:
++        block_a, block_b = row_blocks(d)
+         _attn_res_row_kernel[grid](
+             *args, **meta, BLOCK_A=block_a, BLOCK_B=block_b, num_warps=8
+         )
+diff --git a/vllm/models/inkling2/amd/ops/linear.py b/vllm/models/inkling2/amd/ops/linear.py
+index cdfa59f26e..b1e237c5ac 100644
+--- a/vllm/models/inkling2/amd/ops/linear.py
++++ b/vllm/models/inkling2/amd/ops/linear.py
+@@ -150,3 +150,212 @@ def linear_k_groups(
+         partials, out, out.numel(), partials.shape[0], 1024
+     )
+     return out
++
++
++@triton.jit
++def _gemv_kernel(
++    X,
++    W,
++    Y,
++    N,
++    stride_xs,
++    stride_ws,
++    stride_wn,
++    stride_ys,
++    K: tl.constexpr,
++    BN: tl.constexpr,
++    BK: tl.constexpr,
++):
++    # One program: BN output rows of one stream, the whole K in BK chunks,
++    # fp32 products accumulated per lane and summed once at the end.
++    s = tl.program_id(1).to(tl.int64)
++    rows = tl.program_id(0) * BN + tl.arange(0, BN)
++    w_rows = W + s * stride_ws + rows[:, None].to(tl.int64) * stride_wn
++    acc = tl.zeros((BN, BK), tl.float32)
++    for k0 in tl.static_range(0, K, BK):
++        ks = k0 + tl.arange(0, BK)
++        x = tl.load(X + s * stride_xs + ks, ks < K, other=0)
++        w = tl.load(
++            w_rows + ks[None, :], (rows[:, None] < N) & (ks[None, :] < K), other=0
++        )
++        acc += w.to(tl.float32) * x.to(tl.float32)[None, :]
++    tl.store(Y + s * stride_ys + rows, tl.sum(acc, 1).to(Y.dtype.element_ty), rows < N)
++
++
++def _gemv_config(streams: int, n: int, k: int) -> tuple[int, int, int]:
++    """(BN, BK, num_warps) for one-row GEMVs on gfx12 (64 CUs): enough
++    programs to cover the CUs a few times, 16-byte-plus loads per lane."""
++    if k <= 128:
++        return 64, triton.next_power_of_2(k), 4
++    bk = 1024 if k % 1024 == 0 else 512
++    work = streams * n
++    bn = 2 if work <= 512 else 4 if work <= 1024 or work >= 8192 else 8
++    return bn, bk, 8 if bk == 1024 else 4
++
++
++def gemv(
++    x: torch.Tensor, weight: torch.Tensor, out_dtype: torch.dtype | None = None
++) -> torch.Tensor:
++    """One-row `x @ weight.T` per stream, for decode.
++
++    `x` is bf16 `(S, 1, K)` with `weight` `(S, N, K)`, or `(1, K)` with
++    `(N, K)`; returns `(S, 1, N)` / `(1, N)` in `out_dtype` (default
++    `x.dtype`), accumulated in fp32. Rows of `weight` must be contiguous along
++    K; `x`'s last dim too.
++    """
++    batched = weight.dim() == 3
++    if not batched:
++        x, weight = x.unsqueeze(0), weight.unsqueeze(0)
++    streams, n, k = weight.shape
++    assert x.shape == (streams, 1, k), (x.shape, weight.shape)
++    assert x.stride(-1) == 1 and weight.stride(-1) == 1
++    out = torch.empty((streams, 1, n), dtype=out_dtype or x.dtype, device=x.device)
++    bn, bk, num_warps = _gemv_config(streams, n, k)
++    _gemv_kernel[(triton.cdiv(n, bn), streams)](
++        x,
++        weight,
++        out,
++        n,
++        x.stride(0),
++        weight.stride(0),
++        weight.stride(1),
++        out.stride(0),
++        k,
++        bn,
++        bk,
++        num_warps=num_warps,
++    )
++    return out if batched else out[0]
++
++
++@triton.jit
++def _gemv_rows_kernel(
++    X,
++    W,
++    Y,
++    M,
++    N,
++    stride_xs,
++    stride_xm,
++    stride_ws,
++    stride_wn,
++    stride_ys,
++    stride_ym,
++    K: tl.constexpr,
++    BM: tl.constexpr,
++    BN: tl.constexpr,
++    BK: tl.constexpr,
++    MODE: tl.constexpr,
++):
++    # One program: BN output columns of one stream for all M (<= BM) rows,
++    # each weight tile read once. MODE 0: matrix cores (BM >= 16); 1: fp32
++    # FMAs over a (BM, BN, BK) product reduced per chunk; 2: fp32 FMAs kept
++    # per lane and summed once at the end (`gemv`'s order, per row).
++    s = tl.program_id(1).to(tl.int64)
++    cols = tl.program_id(0) * BN + tl.arange(0, BN)
++    rows = tl.arange(0, BM)
++    w_rows = W + s * stride_ws + cols[:, None].to(tl.int64) * stride_wn
++    x_rows = X + s * stride_xs + rows[:, None] * stride_xm
++    if MODE == 2:
++        acc3 = tl.zeros((BM, BN, BK), tl.float32)
++    else:
++        acc = tl.zeros((BM, BN), tl.float32)
++    for k0 in range(0, K, BK):
++        ks = k0 + tl.arange(0, BK)
++        x = tl.load(
++            x_rows + ks[None, :], (rows[:, None] < M) & (ks[None, :] < K), other=0
++        )
++        w = tl.load(
++            w_rows + ks[None, :], (cols[:, None] < N) & (ks[None, :] < K), other=0
++        )
++        if MODE == 0:
++            acc = tl.dot(x, tl.trans(w), acc)
++        elif MODE == 1:
++            acc += tl.sum(
++                x.to(tl.float32)[:, None, :] * w.to(tl.float32)[None, :, :], 2
++            )
++        else:
++            acc3 += w.to(tl.float32)[None, :, :] * x.to(tl.float32)[:, None, :]
++    if MODE == 2:
++        acc = tl.sum(acc3, 2)
++    tl.store(
++        Y + s * stride_ys + rows[:, None] * stride_ym + cols[None, :],
++        acc.to(Y.dtype.element_ty),
++        (rows[:, None] < M) & (cols[None, :] < N),
++    )
++
++
++GEMV_ROWS_MAX = 16
++
++
++def _gemv_rows_config(
++    streams: int, m: int, n: int, k: int
++) -> tuple[int, int, int, int, int]:
++    """(BM, BN, BK, mode, num_warps) for 2..16-row GEMVs on gfx12 (64 CUs),
++    from `s1_bench_rows2.py` sweeps at M=8 (HIP graph over cold weights)."""
++    if k <= 128:
++        # Controller up-projections (K = rank 64): matrix cores, whole K.
++        return 16, 16, triton.next_power_of_2(k), 0, 4
++    if n <= 256:
++        # Controller down-projections (N = rank 64, K = 4608): too few
++        # columns for 16-wide tiles; fp32 FMAs on a few columns per program.
++        bm = triton.next_power_of_2(m)
++        return bm, 1 if streams == 1 else 2, 512 if bm <= 8 else 256, 2, 8
++    # Wide projections: 64 columns per program on matrix cores (~590 GB/s).
++    return 16, 64, 256 if k % 256 == 0 and k >= 3072 else 128, 0, 4
++
++
++def gemv_rows(
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    out_dtype: torch.dtype | None = None,
++    config: tuple[int, int, int, int, int] | None = None,
++) -> torch.Tensor:
++    """`x @ weight.T` for a few (2..16) rows per stream: spec-decode verify
++    windows. `x` is bf16 `(S, M, K)` with `weight` `(S, N, K)`, or `(M, K)`
++    with `(N, K)`; fp32 accumulation, each weight element read once."""
++    batched = weight.dim() == 3
++    if not batched:
++        x, weight = x.unsqueeze(0), weight.unsqueeze(0)
++    streams, n, k = weight.shape
++    m = x.shape[1]
++    assert x.shape == (streams, m, k) and m <= GEMV_ROWS_MAX, (x.shape, weight.shape)
++    assert x.stride(-1) == 1 and weight.stride(-1) == 1
++    out = torch.empty((streams, m, n), dtype=out_dtype or x.dtype, device=x.device)
++    bm, bn, bk, mode, num_warps = config or _gemv_rows_config(streams, m, n, k)
++    _gemv_rows_kernel[(triton.cdiv(n, bn), streams)](
++        x,
++        weight,
++        out,
++        m,
++        n,
++        x.stride(0),
++        x.stride(1),
++        weight.stride(0),
++        weight.stride(1),
++        out.stride(0),
++        out.stride(1),
++        k,
++        bm,
++        bn,
++        bk,
++        mode,
++        num_warps=num_warps,
++    )
++    return out if batched else out[0]
++
++
++def decode_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
++    """`nn.functional.linear(x, weight)` (no bias). bf16 decode inputs take
++    the Triton GEMVs, which read the weight faster than hipBLASLt there: one
++    row (batch-1 decode) `gemv`, 2..16 rows (spec-decode verify windows)
++    `gemv_rows`; prefill stays on hipBLASLt."""
++    if (
++        x.dim() == 2
++        and 1 <= x.shape[0] <= GEMV_ROWS_MAX
++        and x.dtype == weight.dtype == torch.bfloat16
++        and x.stride(-1) == 1
++        and weight.stride(-1) == 1
++    ):
++        return gemv(x, weight) if x.shape[0] == 1 else gemv_rows(x, weight)
++    return torch.nn.functional.linear(x, weight)
+diff --git a/vllm/models/inkling2/amd/ops/loop.py b/vllm/models/inkling2/amd/ops/loop.py
+new file mode 100644
+index 0000000000..9a59a3d1e3
+--- /dev/null
++++ b/vllm/models/inkling2/amd/ops/loop.py
+@@ -0,0 +1,224 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Loop message controllers, batched over streams.
++
++A controller blends a fp32 message into a fp32 sublayer input `dest`: from
++`h = down(rms([dest, message]))` (bf16), `out = (1 - tanh(forget(h))) * dest +
++tanh(gain(h)) * message` in fp32, unfused as the reference. The output feeds
++the sublayer's RMSNorm, applied in the same kernel.
++
++AMD copy of `nvidia/ops/loop.py`: `tl.rsqrt` instead of the NVIDIA inline-PTX
++`rsqrt.approx` (which compiles on ROCm but returns garbage), and the warp count
++of `ops.norm.rms_norm`, whose reduction order the weightless norms keep.
++"""
++
++import torch
++
++from vllm.triton_utils import tl, tldevice, triton
++
++
++def _num_warps(block: int) -> int:
++    # As `ops.norm.rms_norm`: the same reduction tree, so the same rounding.
++    return min(max(block // 512, 1), 16)
++
++
++@triton.jit
++def _pair_rms_norm_kernel(
++    Dest,
++    Message,
++    Out,
++    stride_dest_s,
++    T,
++    eps,
++    D: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    s = tl.program_id(0).to(tl.int64)
++    t = tl.program_id(1).to(tl.int64)
++    cols = tl.arange(0, BLOCK)
++    mask = cols < D
++    dest = tl.load(Dest + s * stride_dest_s + t * D + cols, mask, other=0)
++    message = tl.load(Message + (s * T + t) * D + cols, mask, other=0)
++    dest_rstd = tl.rsqrt(tl.div_rn(tl.sum(dest * dest), D) + eps)
++    message_rstd = tl.rsqrt(tl.div_rn(tl.sum(message * message), D) + eps)
++    out = Out + (s * T + t) * (2 * D)
++    tl.store(out + cols, (dest * dest_rstd).to(Out.dtype.element_ty), mask)
++    tl.store(out + D + cols, (message * message_rstd).to(Out.dtype.element_ty), mask)
++
++
++def pair_rms_norm(dest: torch.Tensor, message: torch.Tensor) -> torch.Tensor:
++    """bf16 `(S, T, 2D)` `[rms(dest), rms(message)]` of fp32 `(S, T, D)`
++    inputs, weightless; `dest` may broadcast over streams (stride 0)."""
++    num_streams, num_tokens, d = message.shape
++    assert dest.shape == message.shape and message.is_contiguous()
++    assert dest.stride(1) == d and dest.stride(2) == 1
++    assert dest.dtype == message.dtype == torch.float32
++    out = message.new_empty((num_streams, num_tokens, 2 * d), dtype=torch.bfloat16)
++    if num_tokens:
++        block = triton.next_power_of_2(d)
++        _pair_rms_norm_kernel[(num_streams, num_tokens)](
++            dest,
++            message,
++            out,
++            dest.stride(0),
++            num_tokens,
++            1e-6,
++            D=d,
++            BLOCK=block,
++            num_warps=_num_warps(block),
++        )
++    return out
++
++
++@triton.jit
++def _blend_rms_norm_kernel(
++    Dest,
++    Message,
++    GainForget,
++    NormW,
++    Out,
++    stride_dest_s,
++    stride_w_s,
++    T,
++    norm_eps,
++    D: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    s = tl.program_id(0).to(tl.int64)
++    t = tl.program_id(1).to(tl.int64)
++    cols = tl.arange(0, BLOCK)
++    mask = cols < D
++    row = s * T + t
++    dest = tl.load(Dest + s * stride_dest_s + t * D + cols, mask, other=0)
++    message = tl.load(Message + row * D + cols, mask, other=0)
++    gain = tldevice.tanh(tl.load(GainForget + row * (2 * D) + cols, mask, other=0))
++    forget = tldevice.tanh(
++        tl.load(GainForget + row * (2 * D) + D + cols, mask, other=0)
++    )
++    x = (1.0 - forget) * dest + gain * message
++    rstd = tl.rsqrt(tl.div_rn(tl.sum(x * x), D) + norm_eps)
++    y = x * rstd
++    y = y * tl.load(NormW + s * stride_w_s + cols, mask, other=0).to(tl.float32)
++    tl.store(Out + row * D + cols, y.to(Out.dtype.element_ty), mask)
++
++
++def blend_rms_norm(
++    dest: torch.Tensor,
++    message: torch.Tensor,
++    gain_forget: torch.Tensor,
++    norm_weight: torch.Tensor,
++    norm_eps: float,
++) -> torch.Tensor:
++    """bf16 `(S, T, D)` RMSNorm (row `s` of `norm_weight` `(S, D)`) of
++    `(1 - tanh(forget)) * dest + tanh(gain) * message`, with fp32 `(S, T, D)`
++    `dest` (may broadcast over streams) and `message`, and fp32 `(S, T, 2D)`
++    `gain_forget` = `[gain, forget]`. `norm_weight` may broadcast too."""
++    num_streams, num_tokens, d = message.shape
++    assert dest.shape == message.shape and message.is_contiguous()
++    assert dest.stride(1) == d and dest.stride(2) == 1
++    assert gain_forget.shape == (num_streams, num_tokens, 2 * d)
++    assert gain_forget.is_contiguous() and gain_forget.dtype == torch.float32
++    assert norm_weight.shape == (num_streams, d) and norm_weight.stride(1) == 1
++    out = message.new_empty((num_streams, num_tokens, d), dtype=torch.bfloat16)
++    if num_tokens:
++        block = triton.next_power_of_2(d)
++        _blend_rms_norm_kernel[(num_streams, num_tokens)](
++            dest,
++            message,
++            gain_forget,
++            norm_weight,
++            out,
++            dest.stride(0),
++            norm_weight.stride(0),
++            num_tokens,
++            norm_eps,
++            D=d,
++            BLOCK=block,
++            num_warps=_num_warps(block),
++            # The blend is unfused (no FMA), as the reference.
++            enable_fp_fusion=False,
++        )
++    return out
++
++
++@triton.jit
++def _pair_norm_gemv_kernel(
++    Dest,
++    Message,
++    W,
++    Y,
++    stride_dest_s,
++    stride_ws,
++    stride_wn,
++    N,
++    eps,
++    D: tl.constexpr,
++    BLOCK: tl.constexpr,
++    BN: tl.constexpr,
++    BK: tl.constexpr,
++):
++    # `_pair_rms_norm_kernel` of one stream's row (each program recomputes
++    # the two RMS), feeding `ops.linear._gemv_kernel`'s tile of BN rows.
++    s = tl.program_id(1).to(tl.int64)
++    dest_row = Dest + s * stride_dest_s
++    message_row = Message + s * D
++    cols = tl.arange(0, BLOCK)
++    mask = cols < D
++    dest = tl.load(dest_row + cols, mask, other=0)
++    message = tl.load(message_row + cols, mask, other=0)
++    dest_rstd = tl.rsqrt(tl.div_rn(tl.sum(dest * dest), D) + eps)
++    message_rstd = tl.rsqrt(tl.div_rn(tl.sum(message * message), D) + eps)
++
++    K: tl.constexpr = 2 * D
++    rows = tl.program_id(0) * BN + tl.arange(0, BN)
++    w_rows = W + s * stride_ws + rows[:, None].to(tl.int64) * stride_wn
++    acc = tl.zeros((BN, BK), tl.float32)
++    for k0 in tl.static_range(0, K, BK):
++        ks = k0 + tl.arange(0, BK)
++        is_dest = ks < D
++        xd = tl.load(dest_row + ks, is_dest, other=0) * dest_rstd
++        xm = tl.load(message_row + ks - D, (ks >= D) & (ks < K), other=0)
++        x = tl.where(is_dest, xd, xm * message_rstd).to(tl.bfloat16)
++        w = tl.load(
++            w_rows + ks[None, :], (rows[:, None] < N) & (ks[None, :] < K), other=0
++        )
++        acc += w.to(tl.float32) * x.to(tl.float32)[None, :]
++    y = tl.sum(acc, 1).to(Y.dtype.element_ty)
++    tl.store(Y + s * N + rows, y, rows < N)
++
++
++def pair_norm_gemv(
++    dest: torch.Tensor, message: torch.Tensor, weight: torch.Tensor
++) -> torch.Tensor:
++    """`gemv(pair_rms_norm(dest, message), weight)` for one token: fp32
++    `(S, 1, D)` `dest` (may broadcast over streams) and `message`, bf16
++    `(S, N, 2D)` `weight`; returns bf16 `(S, 1, N)`, the same bits as the
++    two launches."""
++    from .linear import _gemv_config
++
++    num_streams, num_tokens, d = message.shape
++    assert num_tokens == 1 and dest.shape == message.shape
++    assert message.is_contiguous() and dest.stride(2) == 1
++    assert dest.dtype == message.dtype == torch.float32
++    n = weight.shape[1]
++    assert weight.shape == (num_streams, n, 2 * d) and weight.stride(2) == 1
++    assert weight.dtype == torch.bfloat16
++    bn, bk, num_warps = _gemv_config(num_streams, n, 2 * d)
++    out = message.new_empty((num_streams, 1, n), dtype=torch.bfloat16)
++    _pair_norm_gemv_kernel[(triton.cdiv(n, bn), num_streams)](
++        dest,
++        message,
++        weight,
++        out,
++        dest.stride(0),
++        weight.stride(0),
++        weight.stride(1),
++        n,
++        1e-6,
++        D=d,
++        BLOCK=triton.next_power_of_2(d),
++        BN=bn,
++        BK=bk,
++        num_warps=num_warps,
++    )
++    return out
+diff --git a/vllm/models/inkling2/amd/ops/moe.py b/vllm/models/inkling2/amd/ops/moe.py
+index 10b3c1c366..db654a066f 100644
+--- a/vllm/models/inkling2/amd/ops/moe.py
++++ b/vllm/models/inkling2/amd/ops/moe.py
+@@ -5,6 +5,8 @@ expert GEMMs (`triton_bmm`) with the activations quantized to MXFP8 into it,
+ and the top-k combine.
+ """
+ 
++import functools
++
+ import torch
+ 
+ from vllm.triton_utils import tl, tldevice, triton
+@@ -389,6 +391,23 @@ def _store_x(
+ FUSED_ROUTING_MAX_TOKENS = 16
+ 
+ 
++@functools.cache
++def _cooperative_routing() -> bool:
++    """Whether the fused routing kernel is launched as a cooperative grid.
++
++    Its token programs spin on the router programs and on each other, so all
++    of them must make progress. Workgroups are dispatched in program order:
++    the routers (first, waiting on nothing) always finish, and the at most
++    `FUSED_ROUTING_MAX_TOKENS` token programs fit at once on any of these
++    GPUs, so a plain launch cannot deadlock either. On gfx12 a cooperative
++    launch costs 9 to 70 us per call in HIP graphs (R9700, 12 us without),
++    so it is used on gfx950 only.
++    """
++    from vllm.platforms.rocm import on_gfx12x
++
++    return not on_gfx12x()
++
++
+ @triton.jit
+ def _fused_route_kernel(
+     X,
+@@ -679,7 +698,7 @@ def route(
+             num_warps=4,
+             num_stages=4,
+             enable_fp_fusion=False,
+-            launch_cooperative_grid=True,
++            launch_cooperative_grid=_cooperative_routing(),
+         )
+         return outputs, quantized
+ 
+@@ -756,8 +775,9 @@ def combine(
+     """Sum each token's rows of `down` (rows -1 count 0)."""
+     tokens = src2dst.numel() // topk
+     hidden = down.shape[1]
+-    block = 512
+-    assert hidden % block == 0
++    # 512 columns per program, 256 for Inkling-2-Mini's hidden 2304.
++    block = min(512, hidden & -hidden)
++    assert block >= 64
+     out = torch.empty((tokens, hidden), dtype=out_dtype, device=down.device)
+     _combine_kernel[(tokens, hidden // block)](
+         down, src2dst, out, hidden, topk, block, num_warps=2
+diff --git a/vllm/models/inkling2/amd/ops/norm.py b/vllm/models/inkling2/amd/ops/norm.py
+index a0221df5f3..919b2f4a68 100644
+--- a/vllm/models/inkling2/amd/ops/norm.py
++++ b/vllm/models/inkling2/amd/ops/norm.py
+@@ -57,14 +57,52 @@ def rms_norm(
+     return out
+ 
+ 
++@triton.jit
++def _fused_add_rms_norm_kernel(
++    X,
++    Res,
++    W,
++    stride_x,
++    stride_res,
++    N: tl.constexpr,
++    eps,
++    BLOCK: tl.constexpr,
++):
++    row = tl.program_id(0).to(tl.int64)
++    cols = tl.arange(0, BLOCK)
++    mask = cols < N
++    x = tl.load(X + row * stride_x + cols, mask, other=0).to(tl.float32)
++    total = x + tl.load(Res + row * stride_res + cols, mask, other=0).to(tl.float32)
++    tl.store(Res + row * stride_res + cols, total.to(Res.dtype.element_ty), mask)
++    # The math of `_rms_norm_kernel` on the unrounded fp32 sum.
++    rstd = tl.rsqrt(tl.div_rn(tl.sum(total * total), N) + eps)
++    y = total * rstd
++    y = y * tl.load(W + cols, mask, other=0).to(tl.float32)
++    tl.store(X + row * stride_x + cols, y.to(X.dtype.element_ty), mask)
++
++
+ def fused_add_rms_norm(
+     x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
+ ) -> None:
+     """In place: `residual += x; x = rms_norm(residual)`, normalizing the
+-    unrounded fp32 sum (as flashinfer's `fused_add_rmsnorm`)."""
+-    total = x.float() + residual
+-    residual.copy_(total)
+-    x.copy_(rms_norm(total, weight, eps, x.dtype))
++    unrounded fp32 sum (as flashinfer's `fused_add_rmsnorm`). One launch,
++    the same math as `rms_norm` of the fp32 sum."""
++    n = x.shape[-1]
++    assert x.shape == residual.shape and x.stride(-1) == residual.stride(-1) == 1
++    x2d, res2d = x.view(-1, n), residual.view(-1, n)
++    if x2d.shape[0]:
++        block = triton.next_power_of_2(n)
++        _fused_add_rms_norm_kernel[(x2d.shape[0],)](
++            x2d,
++            res2d,
++            weight,
++            x2d.stride(0),
++            res2d.stride(0),
++            n,
++            eps,
++            BLOCK=block,
++            num_warps=min(max(block // 512, 1), 16),
++        )
+ 
+ 
+ @triton.jit
+diff --git a/vllm/models/inkling2/amd/ops/nvfp4_moe.py b/vllm/models/inkling2/amd/ops/nvfp4_moe.py
+new file mode 100644
+index 0000000000..5f12b2ffec
+--- /dev/null
++++ b/vllm/models/inkling2/amd/ops/nvfp4_moe.py
+@@ -0,0 +1,525 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Triton NVFP4 batched expert GEMMs for the Inkling2 MoE on gfx12.
++
++Same contract as `triton_bmm.bmm` (expert-sorted, tile-padded MXFP8 activation
++rows with block scales in the R8c4 / R128c4 layout of `mxfp8`, routing `tiles`
++of `moe.route`), with NVFP4 expert weights exactly as stored in the
++checkpoint: `weight` uint8 [E, N, K / 2] (two e2m1 codes per byte, low nibble
++= even k), `weight_scale` e4m3 [E, N, K / 16], `amax` fp32 [E] and
++`denominator` fp32 [1]:
++
++    w[e, n, k] = e2m1(weight) * weight_scale[e, n, k // 16] * amax[e] / denominator
++
++with the outer scale `amax[e] / denominator` applied to each output row's fp32
++accumulator, as NVIDIA's GEMMs and `nvfp4_ref.nvfp4_bmm_reference` do.
++
++RDNA4 has no FP4 or block-scaled matrix instructions. The kernel decodes
++both operands to fp16 in registers with a few integer ops per 4 bytes (inline
++asm: Triton lowers 8-bit ops element by element on gfx12) and runs fp16 x
++fp16 -> fp32 WMMA per 32-wide K group (one activation scale block). Weights
++are decoded with their e4m3 block scales folded in, which is exact in fp16
++(e2m1 x e4m3 has at most 6 significant bits); the ue8m0 activation scales
++scale each group's fp32 partial sum. Every product is exact, so the result
++equals the fp32 reference up to the order of the fp32 additions. No host
++syncs: the grid is the plan's upper bound and programs past the routed tiles
++return, so the GEMM can be captured in a HIP graph.
++
++Decode plans (a row or two per expert) run `gemv` instead: no WMMA, fp16
++pair dots (v_dot2_f32_f16) of the same exact decodes, the block scales on
++the fp32 sums of 8 products, closer to the memory bandwidth.
++"""
++
++import functools
++from dataclasses import dataclass
++
++import torch
++
++from vllm.triton_utils import tl, triton
++
++from .mxfp8 import _scale_offsets
++from .triton_bmm import ExpertPlan, _e8m0_to_f32
++
++# Inline asm for gfx12 (pack=2: one VGPR $N holds two 16-bit elements, i.e.
++# 4 consecutive bytes b0..b3). Triton lowers fp8 / 8-bit integer ops element
++# by element on this target; these decode two values per instruction.
++#
++# NVFP4: the 8 codes of b0..b3 (two uint16 elements b0 b1 | b2 b3; low nibble
++# = even k) -> fp16 pairs times the fp16 block scale pair $5, per element
++# $0 = low nibble of its first byte, $1 = high nibble of it, $2, $3 = the
++# same for its second byte; $4 is scratch. A code's fp16 bits (worth 2^-14
++# times its e2m1 value, subnormals included) are its 3 magnitude bits at
++# 9-11 and its sign at 15, i.e. only a high byte: first all 8 high bytes
++# (low nibbles to $0, high to $4, one per byte), then each fp16 pair is a
++# byte permute with zero low bytes. The products e2m1 * e4m3 * 2^-14 have at
++# most 6 significant bits and are multiples of 2^-24 below 2^-2: exact fp16.
++_NVFP4_TO_F16 = tl.constexpr(
++    """
++    v_lshlrev_b32 $4, 4, $5
++    v_lshlrev_b32 $0, 1, $5
++    v_and_b32 $0, 0x0e0e0e0e, $0
++    v_and_or_b32 $0, $4, 0x80808080, $0
++    v_lshrrev_b32 $4, 3, $5
++    v_and_b32 $4, 0x0e0e0e0e, $4
++    v_and_or_b32 $4, $5, 0x80808080, $4
++    v_perm_b32 $1, $4, $0, 0x050c010c
++    v_perm_b32 $2, $4, $0, 0x060c020c
++    v_perm_b32 $3, $4, $0, 0x070c030c
++    v_perm_b32 $0, $4, $0, 0x040c000c
++    v_pk_mul_f16 $0, $0, $6
++    v_pk_mul_f16 $1, $1, $6
++    v_pk_mul_f16 $2, $2, $6
++    v_pk_mul_f16 $3, $3, $6
++    """
++)
++# e4m3: b0..b3 -> fp16 pairs $0 = (b0, b2), $1 = (b1, b3), each worth 2^-8
++# times the e4m3 value (exponent and mantissa shifted into fp16's fields;
++# e4m3 subnormals become fp16 subnormals). Exact for finite e4m3 (the NaN
++# code 0x7f becomes a finite value).
++_E4M3_TO_F16 = tl.constexpr(
++    """
++    v_lshlrev_b32 $1, 8, $2
++    v_lshlrev_b32 $0, 7, $2
++    v_and_b32 $0, 0x3f803f80, $0
++    v_and_or_b32 $0, $1, 0x80008000, $0
++    v_lshrrev_b32 $1, 1, $2
++    v_and_b32 $1, 0x3f803f80, $1
++    v_and_or_b32 $1, $2, 0x80008000, $1
++    """
++)
++
++
++@triton.jit
++def _e4m3_to_f32(x):
++    """fp32 value of the (finite) e4m3 bytes `x`, exactly (see
++    `_E4M3_TO_F16`). Avoids the compare/select chain Triton emits for
++    fp8 -> fp32 on gfx12."""
++    x = x.to(tl.uint8, bitcast=True).to(tl.uint16)
++    h = ((x & 0x80) << 8) | ((x & 0x7F) << 7)
++    return h.to(tl.float16, bitcast=True).to(tl.float32) * 256.0
++
++
++@triton.jit
++def _e4m3_to_f16(x, R: tl.constexpr, C: tl.constexpr):
++    """fp16 [R, 2 C]: 2^-8 times the e4m3 values whose byte pairs are the
++    uint16 `x` [R, C] (little endian), exactly."""
++    even, odd = tl.inline_asm_elementwise(
++        _E4M3_TO_F16,
++        "=&v,=&v,v",
++        [x.to(tl.uint16, bitcast=True)],
++        dtype=(tl.float16, tl.float16),
++        is_pure=True,
++        pack=2,
++    )
++    return tl.join(even, odd).reshape(R, 2 * C)
++
++
++@triton.jit
++def _nvfp4_to_f16(codes, scale, BN: tl.constexpr, BK: tl.constexpr):
++    """fp16 [BN, BK]: 2^-14 times the e2m1 values of the packed codes
++    `codes` uint16 [BN, BK / 4] (bytes little endian, low nibble = even k)
++    times their fp16 block `scale` [BN, BK / 16], exactly."""
++    scale = tl.broadcast_to(scale[:, :, None], (BN, BK // 16, 4)).reshape(BN, BK // 4)
++    k0, k1, k2, k3, _ = tl.inline_asm_elementwise(
++        _NVFP4_TO_F16,
++        "=&v,=&v,=&v,=&v,=&v,v,v",
++        [codes.to(tl.uint16, bitcast=True), scale],
++        dtype=(tl.float16,) * 5,
++        is_pure=True,
++        pack=2,
++    )
++    # Registers hold (k, k + 1) pairs: o_j[2i + p] = k(8 i + 2 j + p).
++    t = tl.join(
++        tl.join(k0.reshape(BN, BK // 8, 2), k2.reshape(BN, BK // 8, 2)),
++        tl.join(k1.reshape(BN, BK // 8, 2), k3.reshape(BN, BK // 8, 2)),
++    )
++    return tl.permute(t, (0, 1, 3, 4, 2)).reshape(BN, BK)
++
++
++@triton.jit
++def _nvfp4_bmm_kernel(
++    A,
++    AScale,
++    W,
++    WScale,
++    Amax,
++    Denominator,
++    Out,
++    Tiles,
++    max_ctas,
++    N: tl.constexpr,
++    K: tl.constexpr,
++    TILE: tl.constexpr,
++    BM: tl.constexpr,
++    BN: tl.constexpr,
++    BK: tl.constexpr,
++):
++    # Program (n, m) computes BM rows of token tile m // SUB (a part of it,
++    # or the whole tile when it has fewer than BM rows); only routed rows
++    # are read and written. BK (a multiple of 32) is the K step of the loop;
++    # its 32-wide activation scale groups are unrolled, one fp16 dot each:
++    # weights decoded with their block scales folded in (exact), activations
++    # decoded without theirs, which scale the fp32 partial sums.
++    SUB: tl.constexpr = TILE // BM if TILE >= BM else 1
++    pid_m = tl.program_id(1)
++    tile = pid_m // SUB
++    if tile >= tl.load(Tiles + 2 * max_ctas):
++        return
++    row_end = tl.load(Tiles + max_ctas + tile)
++    row0 = tile * TILE + (pid_m % SUB) * BM
++    if row0 >= row_end:
++        return
++    expert = tl.load(Tiles + tile).to(tl.int64)
++    rows = row0 + tl.arange(0, BM)
++    in_tile = rows < row_end
++    cols = tl.program_id(0) * BN + tl.arange(0, BN)
++    # A and W as int16 (byte pairs).
++    a_ptrs = A + rows[:, None].to(tl.int64) * (K // 2) + tl.arange(0, 16)[None, :]
++    w_ptrs = W + (expert * N + cols[:, None]) * (K // 4) + tl.arange(0, 8)[None, :]
++    ws_ptrs = (
++        WScale + (expert * N + cols[:, None]) * (K // 16) + tl.arange(0, 2)[None, :]
++    )
++    acc = tl.zeros((BM, BN), tl.float32)
++    for k in range(0, K, BK):
++        for g in tl.static_range(BK // 32):
++            kg = k + g * 32
++            # Unmasked: rows past the routed ones are the (allocated) tile
++            # padding and only reach their own, unstored, output rows.
++            a = _e4m3_to_f16(tl.load(a_ptrs + kg // 2), BM, 16)
++            a_scale = tl.load(AScale + _scale_offsets(rows, kg // 32, K // 32, TILE))
++            w_scale = _e4m3_to_f32(tl.load(ws_ptrs + kg // 16)).to(tl.float16)
++            w = _nvfp4_to_f16(tl.load(w_ptrs + kg // 4), w_scale, BN, 32)
++            part = tl.dot(a, tl.trans(w))
++            acc += part * _e8m0_to_f32(a_scale)[:, None]
++    # 2^22 undoes the decodes' 2^-8 (activations) and 2^-14 (weights); then
++    # the outer scale in fp32.
++    outer = tl.div_rn(tl.load(Amax + expert), tl.load(Denominator))
++    out = (acc * 4194304.0) * outer
++    out_ptrs = Out + rows[:, None].to(tl.int64) * N + cols[None, :]
++    tl.store(out_ptrs, out.to(tl.bfloat16), in_tile[:, None])
++
++
++# Decode (a row or two per expert): a GEMV-style kernel without WMMA, so no
++# layout conversions through LDS between the loads and the math, and the
++# whole K unrolled so that a thread has many loads in flight. A thread takes
++# whole 32-wide K groups (one activation scale block): 4 codes words (16
++# bytes) with their block scale bytes. A codes word (8 codes k0..k7, low
++# nibble = even k) decodes to the fp16 pairs (k0, k2), (k1, k3), (k4, k6),
++# (k5, k7), 2^-14 times the e2m1 values (as in `_NVFP4_TO_F16`, fp16
++# subnormals below 1); the word's 8 activation bytes decode to the same
++# pairs (`_E4M3_TO_F16`) and v_dot2_f32_f16 sums the 8 exact products in
++# fp32. The word's e4m3 block scale (shared by the 16-wide block) then
++# scales that fp32 sum, the activation scale the group's sum.
++#
++# $5 = codes word; $0..$3 the pairs, $4 scratch.
++_NVFP4_WORD_TO_F16 = tl.constexpr(
++    """
++    v_lshlrev_b32 $4, 4, $5
++    v_lshlrev_b32 $0, 1, $5
++    v_and_b32 $0, 0x0e0e0e0e, $0
++    v_and_or_b32 $0, $4, 0x80808080, $0
++    v_lshrrev_b32 $4, 3, $5
++    v_and_b32 $4, 0x0e0e0e0e, $4
++    v_and_or_b32 $4, $5, 0x80808080, $4
++    v_perm_b32 $1, $4, $0, 0x050c040c
++    v_perm_b32 $2, $4, $0, 0x030c020c
++    v_perm_b32 $3, $4, $0, 0x070c060c
++    v_perm_b32 $0, $4, $0, 0x010c000c
++    """
++)
++# Sum of the 4 pair products: weights $1..$4, activations $5..$8.
++_DOT8 = tl.constexpr(
++    """
++    v_dot2_f32_f16 $0, $1, $5, 0
++    v_dot2_f32_f16 $0, $2, $6, $0
++    v_dot2_f32_f16 $0, $3, $7, $0
++    v_dot2_f32_f16 $0, $4, $8, $0
++    """
++)
++
++
++@triton.jit
++def _nvfp4_gemv_groups(
++    w_row,
++    s_row,
++    a_row,
++    AScale,
++    row,
++    k,
++    KG: tl.constexpr,
++    TILE: tl.constexpr,
++    G: tl.constexpr,
++):
++    """fp32 [BN]: 2^-22 times the dot products over the 32-wide K groups
++    k .. k + G - 1 (those below KG) of BN weight rows (`w_row` int32 and
++    `s_row` uint8 [BN, 1, 1] pointers) with activation row `row` (`a_row`,
++    int64)."""
++    g = tl.arange(0, G)
++    g_in = (k + g) < KG
++    words = (k + g)[None, :, None] * 4 + tl.arange(0, 4)[None, None, :]
++    c = tl.load(w_row + words, g_in[None, :, None], other=0)
++    # One block scale byte per codes word: a load of the weights' shape and
++    # order, which Triton gives the weights' layout (no conversion).
++    s = tl.load(s_row + words // 2, g_in[None, :, None], other=0)
++    w0, w1, w2, w3, _ = tl.inline_asm_elementwise(
++        _NVFP4_WORD_TO_F16,
++        "=&v,=&v,=&v,=&v,=&v,v",
++        [c],
++        dtype=(tl.int32,) * 5,
++        is_pure=True,
++        pack=1,
++    )
++    # Unmasked rows: past the routed ones they are the (allocated) tile
++    # padding and only reach their own, unstored, output rows.
++    a = tl.load(a_row + words, g_in[None, :, None], other=0)
++    a0, a1 = tl.inline_asm_elementwise(
++        _E4M3_TO_F16,
++        "=&v,=&v,v",
++        [a.to(tl.int32)],
++        dtype=(tl.int32, tl.int32),
++        is_pure=True,
++        pack=1,
++    )
++    a2, a3 = tl.inline_asm_elementwise(
++        _E4M3_TO_F16,
++        "=&v,=&v,v",
++        [(a >> 32).to(tl.int32)],
++        dtype=(tl.int32, tl.int32),
++        is_pure=True,
++        pack=1,
++    )
++    part = tl.inline_asm_elementwise(
++        _DOT8,
++        "=&v,v,v,v,v,v,v,v,v",
++        [w0, w1, w2, w3, a0, a1, a2, a3],
++        dtype=tl.float32,
++        is_pure=True,
++        pack=1,
++    )
++    part = part * _e4m3_to_f32(s)
++    a_scale = tl.load(AScale + _scale_offsets(row, k + g, KG, TILE), g_in, other=0)
++    # Masked groups: zero codes and activations give 0 * 2^-127.
++    return tl.sum(tl.sum(part, 2) * _e8m0_to_f32(a_scale)[None, :], 1)
++
++
++@triton.jit
++def _nvfp4_gemv_kernel(
++    A,
++    AScale,
++    W,
++    WScale,
++    Amax,
++    Denominator,
++    Out,
++    Tiles,
++    max_ctas,
++    N: tl.constexpr,
++    K: tl.constexpr,
++    TILE: tl.constexpr,
++    BN: tl.constexpr,
++    G0: tl.constexpr,
++    G: tl.constexpr,
++):
++    # Program (n, t): BN output columns of token tile t, its routed rows one
++    # at a time (weights re-read from cache past the first), the whole K
++    # unrolled: G0 groups first (one wide load), the rest in steps of G.
++    # `A` as int64 (the 8 activation bytes of a codes word), `W` as int32
++    # (8 codes), `WScale` as uint8.
++    tile = tl.program_id(1)
++    if tile >= tl.load(Tiles + 2 * max_ctas):
++        return
++    row_end = tl.load(Tiles + max_ctas + tile)
++    expert = tl.load(Tiles + tile).to(tl.int64)
++    KG: tl.constexpr = K // 32
++    cols = tl.program_id(0) * BN + tl.arange(0, BN)
++    w_row = W + ((expert * N + cols) * (K // 8))[:, None, None]
++    s_row = WScale + ((expert * N + cols) * (K // 16))[:, None, None]
++    outer = tl.div_rn(tl.load(Amax + expert), tl.load(Denominator))
++    for row in range(tile * TILE, row_end):
++        a_row = A + row.to(tl.int64) * (K // 8)
++        acc = _nvfp4_gemv_groups(w_row, s_row, a_row, AScale, row, 0, KG, TILE, G0)
++        for k in tl.static_range(G0, KG, G):
++            acc += _nvfp4_gemv_groups(w_row, s_row, a_row, AScale, row, k, KG, TILE, G)
++        # 2^22 undoes the decodes' 2^-8 (activations) and 2^-14 (weights).
++        out = (acc * 4194304.0) * outer
++        tl.store(Out + row.to(tl.int64) * N + cols, out.to(tl.bfloat16))
++
++
++@dataclass(frozen=True)
++class Nvfp4GemvConfig:
++    """Decode launch config: BN columns per program; the K groups (32 wide)
++    unrolled as g0 first (one wide load; -1: the largest power of two of
++    them), then steps of g."""
++
++    bn: int
++    g0: int
++    g: int
++    num_warps: int
++
++
++# gfx12 decode configs by K, from a sweep on the R9700 (gfx1201) of Mini's
++# experts at 1 and 8 tokens (`.claude/r9700/scripts/b3_gemv_try.py`).
++_GFX12_GEMV_CONFIGS = {2304: (8, -1, 8, 2), 1152: (8, -1, 4, 1)}
++# The GEMV runs plans of at most this many tiles of 16 rows: up to 2 tokens
++# (top-8). Its cost grows with routed rows (each row of a tile re-decodes the
++# weights) while WMMA's grows with tiles, and real multi-token routing is
++# concentrated (DSpark verify of 8 tokens: 64 rows on ~29 experts, up to 8
++# rows a tile), so WMMA wins from 4 tokens on.
++GEMV_MAX_CTAS = 16
++
++
++@functools.cache
++def gemv_config(n: int, k: int) -> Nvfp4GemvConfig:
++    bn, g0, g, num_warps = _GFX12_GEMV_CONFIGS.get(k, (8, -1, 8, 2))
++    while n % bn:
++        bn //= 2
++    return Nvfp4GemvConfig(bn, g0, g, num_warps)
++
++
++def gemv(
++    act: torch.Tensor,
++    act_scale: torch.Tensor,
++    weight: torch.Tensor,
++    weight_scale: torch.Tensor,
++    amax: torch.Tensor,
++    denominator: torch.Tensor,
++    tiles: torch.Tensor,
++    plan: ExpertPlan,
++    config: Nvfp4GemvConfig | None = None,
++) -> torch.Tensor:
++    """`bmm` for decode: the same contract and result up to the order of the
++    fp32 additions, faster for a few routed rows per expert."""
++    num_experts, n, k_half = weight.shape
++    k = 2 * k_half
++    assert act.shape == (plan.rows, k) and act.dtype == torch.float8_e4m3fn
++    assert weight.dtype == torch.uint8
++    assert weight_scale.shape == (num_experts, n, k // 16)
++    assert weight_scale.dtype == torch.float8_e4m3fn
++    assert weight.is_contiguous() and weight_scale.is_contiguous()
++    assert k % 32 == 0
++    if config is None:
++        config = gemv_config(n, k)
++    g0 = config.g0
++    if g0 < 0:
++        g0 = 1 << ((k // 32).bit_length() - 1)
++    assert n % config.bn == 0 and 0 < g0 <= k // 32, (config, n, k)
++    out = torch.empty((plan.rows, n), dtype=torch.bfloat16, device=act.device)
++    _nvfp4_gemv_kernel[(n // config.bn, plan.max_ctas)](
++        act.view(torch.int64),
++        act_scale,
++        weight.view(torch.int32),
++        weight_scale.view(torch.uint8),
++        amax,
++        denominator,
++        out,
++        tiles,
++        plan.max_ctas,
++        N=n,
++        K=k,
++        TILE=plan.tile,
++        BN=config.bn,
++        G0=g0,
++        G=config.g,
++        num_warps=config.num_warps,
++    )
++    return out
++
++
++@dataclass(frozen=True)
++class Nvfp4BmmConfig:
++    """Launch config: a BM x BN output block per program (BM divides the
++    token tile or covers it), BK-deep K steps (a multiple of 32)."""
++
++    bm: int
++    bn: int
++    bk: int
++    num_warps: int
++    num_stages: int
++
++
++# gfx12 by token tile: (BM, BN, BK, num_warps, num_stages), from a sweep on
++# the R9700 (gfx1201) of Inkling-2-Mini's NVFP4 experts (128 experts, top-8,
++# [2304, 2304] and [2304, 1152]) at 64, 512 and 2048 tokens
++# (`.claude/b1/scripts/bench_nvfp4_bmm.py --sweep`).
++_GFX12_CONFIGS = {
++    16: (16, 64, 128, 4, 3),
++    32: (32, 128, 64, 8, 3),
++    64: (64, 128, 64, 8, 3),
++    128: (64, 256, 64, 4, 2),
++    256: (64, 256, 64, 4, 2),
++}
++
++
++@functools.cache
++def bmm_config(tile: int, n: int, k: int) -> Nvfp4BmmConfig:
++    """Launch config for token tiles of `tile` rows and `[N, K]` experts."""
++    bm, bn, bk, num_warps, num_stages = _GFX12_CONFIGS[min(max(tile, 16), 256)]
++    while n % bn:
++        bn //= 2
++    while k % bk:
++        bk //= 2
++    assert bn >= 16 and bk >= 32, (n, k)
++    return Nvfp4BmmConfig(bm, bn, bk, num_warps, num_stages)
++
++
++def bmm(
++    act: torch.Tensor,
++    act_scale: torch.Tensor,
++    weight: torch.Tensor,
++    weight_scale: torch.Tensor,
++    amax: torch.Tensor,
++    denominator: torch.Tensor,
++    tiles: torch.Tensor,
++    plan: ExpertPlan,
++    config: Nvfp4BmmConfig | None = None,
++) -> torch.Tensor:
++    """bf16 `[plan.rows, N]` expert GEMM of the tile-padded MXFP8 `act` rows
++    (block scales swizzled for `plan.tile`) with NVFP4 expert weights, by
++    each tile's expert (`tiles`: the `moe.route` metadata). Rows past each
++    tile's routed rows are left uninitialized. Decode plans (16-row tiles,
++    at most `GEMV_MAX_CTAS`) run `gemv`; `config` overrides `bmm_config`
++    (tuning) and always runs the WMMA kernel."""
++    num_experts, n, k_half = weight.shape
++    k = 2 * k_half
++    assert act.shape == (plan.rows, k) and act.dtype == torch.float8_e4m3fn
++    assert weight.dtype == torch.uint8
++    assert weight_scale.shape == (num_experts, n, k // 16)
++    assert weight_scale.dtype == torch.float8_e4m3fn
++    assert amax.shape == (num_experts,) and denominator.shape == (1,)
++    assert weight.is_contiguous() and weight_scale.is_contiguous()
++    tile = plan.tile
++    if config is None and tile == 16 and plan.max_ctas <= GEMV_MAX_CTAS:
++        return gemv(
++            act, act_scale, weight, weight_scale, amax, denominator, tiles, plan
++        )
++    out = torch.empty((plan.rows, n), dtype=torch.bfloat16, device=act.device)
++    if config is None:
++        config = bmm_config(tile, n, k)
++    assert n % config.bn == 0 and k % config.bk == 0 and config.bk % 32 == 0
++    # The pack=2 decode needs two codes words per thread: BN x 8 words of a
++    # 32-wide group over num_warps * 32 threads (fewer give wrong results).
++    assert config.bn * 8 >= 64 * config.num_warps, config
++    bm = config.bm
++    assert bm >= tile or tile % bm == 0, (config, tile)
++    sub = tile // bm if tile >= bm else 1
++    _nvfp4_bmm_kernel[(n // config.bn, plan.max_ctas * sub)](
++        act.view(torch.int16),
++        act_scale,
++        weight.view(torch.int16),
++        weight_scale,
++        amax,
++        denominator,
++        out,
++        tiles,
++        plan.max_ctas,
++        N=n,
++        K=k,
++        TILE=tile,
++        BM=bm,
++        BN=config.bn,
++        BK=config.bk,
++        num_warps=config.num_warps,
++        num_stages=config.num_stages,
++        matrix_instr_nonkdim=16,
++    )
++    return out
+diff --git a/vllm/models/inkling2/amd/ops/nvfp4_ref.py b/vllm/models/inkling2/amd/ops/nvfp4_ref.py
+new file mode 100644
+index 0000000000..d15fbd62d0
+--- /dev/null
++++ b/vllm/models/inkling2/amd/ops/nvfp4_ref.py
+@@ -0,0 +1,105 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""PLACEHOLDER NVFP4 expert GEMM in plain torch: slow, exact, not graph-safe.
++
++Stands in for a gfx12 NVFP4 kernel behind the same interface as
++`triton_bmm.bmm` (plus the NVFP4 outer scales), so the NVFP4 expert layers of
++Inkling-2-Mini (0-19) run end to end before that kernel exists. It reads the
++host copy of the routing `tiles` (one device sync per call) and dequantizes
++each routed expert's weights to fp32, so it cannot be captured in a HIP graph;
++run models using it eagerly.
++
++Weights are the checkpoint's tensors as stored (no row shuffle, no scale
++swizzle): `weight` uint8 [E, N, K / 2] holds two e2m1 codes per byte (low
++nibble = even k; bit 3 = sign, bits 0-2 index 0, .5, 1, 1.5, 2, 3, 4, 6),
++`weight_scale` e4m3 [E, N, K / 16], `amax` fp32 [E], `denominator` fp32 [1]:
++
++    w[e, n, k] = e2m1(weight) * weight_scale[e, n, k // 16] * amax[e] / denominator
++
++with `amax[e] / denominator` applied to the GEMM output per row, as NVIDIA's
++GEMMs do. Activations are the MXFP8 rows of `ops.moe.route` /
++`ops.activation.swiglu_quantize`.
++"""
++
++import torch
++
++from .triton_bmm import ExpertPlan
++
++_E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
++_E2M1 = _E2M1 + tuple(-v for v in _E2M1)
++
++
++def dequant_nvfp4(values: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
++    """fp32 `[..., N, K]` of NVFP4 `values` uint8 `[..., N, K / 2]` and their
++    e4m3 block scales `[..., N, K / 16]`, without the outer scale. Exact:
++    every product of an e2m1 value and an e4m3 scale is an fp32."""
++    assert values.dtype == torch.uint8 and scales.dtype == torch.float8_e4m3fn
++    assert scales.shape[-1] * 8 == values.shape[-1]
++    lut = torch.tensor(_E2M1, dtype=torch.float32, device=values.device)
++    codes = torch.stack((values & 0xF, values >> 4), -1).flatten(-2)
++    return lut[codes.long()] * scales.float().repeat_interleave(16, -1)
++
++
++def _scale_offsets(rows: torch.Tensor, cols: int, tile: int) -> torch.Tensor:
++    """Offsets of the block scales of `rows` in the `mxfp8._scale_offsets`
++    layout of `cols`-column scales for `tile`-row token tiles."""
++    r = rows[:, None]
++    c = torch.arange(cols, device=rows.device)[None, :]
++    if tile >= 128:
++        blocks = (r // 128) * (cols // 4) + c // 4
++        return blocks * 512 + (r % 32) * 16 + (r // 32 % 4) * 4 + c % 4
++    return ((r // 8) * (cols // 4) + c // 4) * 32 + (r % 8) * 4 + c % 4
++
++
++def _dequant_act(
++    act: torch.Tensor, act_scale: torch.Tensor, rows: torch.Tensor, tile: int
++) -> torch.Tensor:
++    k = act.shape[1]
++    scales = act_scale.view(torch.uint8).flatten()[_scale_offsets(rows, k // 32, tile)]
++    exp2 = torch.exp2(scales.float() - 127).repeat_interleave(32, -1)
++    return act[rows].float() * exp2
++
++
++def nvfp4_bmm_reference(
++    act: torch.Tensor,
++    act_scale: torch.Tensor,
++    weight: torch.Tensor,
++    weight_scale: torch.Tensor,
++    amax: torch.Tensor,
++    denominator: torch.Tensor,
++    tiles: torch.Tensor,
++    plan: ExpertPlan,
++) -> torch.Tensor:
++    """bf16 `[plan.rows, N]` expert GEMM of the tile-padded MXFP8 `act` rows
++    (block scales swizzled for `plan.tile`) with NVFP4 expert weights, by each
++    tile's expert (`tiles`: the `moe.route` metadata). Rows past each tile's
++    routed rows are 0."""
++    num_experts, n, k_half = weight.shape
++    k = 2 * k_half
++    assert act.shape == (plan.rows, k) and act.dtype == torch.float8_e4m3fn
++    assert weight.dtype == torch.uint8
++    assert weight_scale.shape == (num_experts, n, k // 16)
++    assert amax.shape == (num_experts,) and denominator.shape == (1,)
++    if torch.cuda.is_current_stream_capturing():
++        raise RuntimeError(
++            "nvfp4_bmm_reference is an eager-only placeholder (it syncs on the "
++            "routing tiles); run NVFP4 Inkling2 experts with enforce_eager"
++        )
++    out = torch.zeros((plan.rows, n), dtype=torch.bfloat16, device=act.device)
++    max_ctas, tile = plan.max_ctas, plan.tile
++    host = tiles.tolist()
++    num_tiles = host[2 * max_ctas]
++    rows_by_expert: dict[int, list[torch.Tensor]] = {}
++    for t in range(num_tiles):
++        start, end = t * tile, host[max_ctas + t]
++        if end > start:
++            rows_by_expert.setdefault(host[t], []).append(
++                torch.arange(start, end, device=act.device)
++            )
++    outer = (amax.float() / denominator.float()).tolist()
++    for expert, parts in rows_by_expert.items():
++        rows = torch.cat(parts)
++        a = _dequant_act(act, act_scale, rows, tile)
++        w = dequant_nvfp4(weight[expert], weight_scale[expert])
++        out[rows] = ((a @ w.T) * outer[expert]).to(torch.bfloat16)
++    return out
+diff --git a/vllm/models/inkling2/amd/ops/sconv.py b/vllm/models/inkling2/amd/ops/sconv.py
+index 20cd111722..18f1fb5bad 100644
+--- a/vllm/models/inkling2/amd/ops/sconv.py
++++ b/vllm/models/inkling2/amd/ops/sconv.py
+@@ -24,6 +24,12 @@ RMS-normalizes V per head and writes both to the paged KV cache.
+ 
+ import torch
+ 
++from vllm.models.inkling2.amd.ops.attn_res import (
++    ROW_MAX_PROGRAMS,
++    _row_mix,
++    attn_res,
++    row_blocks,
++)
+ from vllm.models.inkling2.amd.ops.norm import qr_clip_rel_tokens
+ from vllm.triton_utils import tl, triton
+ 
+@@ -460,6 +466,345 @@ def short_conv(
+     return out
+ 
+ 
++@triton.jit
++def _conv_mix_part(
++    x_ptr,
++    cache_ptr,
++    weight_ptr,
++    out_ptr,
++    res_ptr,
++    addend_ptr,
++    pos_ptr,
++    seq_idx_ptr,
++    slot_ptr,
++    block_table_ptr,
++    qstart_ptr,
++    T,
++    stride_x,
++    stride_c_blk,
++    stride_c_h,
++    stride_c_n,
++    stride_w0,
++    stride_w1,
++    stride_bt,
++    max_blocks,
++    N,
++    scale,
++    toff,
++    coff,
++    W: tl.constexpr,
++    OFF: tl.constexpr,
++    WS: tl.constexpr,
++    H: tl.constexpr,
++    HAS_RES: tl.constexpr,
++    HAS_ADDEND: tl.constexpr,
++):
++    # `_sconv_kernel`'s decode tile (CACHE_FIRST) on columns `coff`.
++    C = H * WS
++    t_mask = toff < T
++    c_mask = coff < C
++    y = _conv(
++        x_ptr,
++        stride_x,
++        cache_ptr,
++        tl.minimum(coff // WS, H - 1) * stride_c_h + OFF + coff % WS,
++        stride_c_blk,
++        stride_c_n,
++        N,
++        weight_ptr,
++        stride_w0,
++        stride_w1,
++        pos_ptr,
++        seq_idx_ptr,
++        slot_ptr,
++        block_table_ptr,
++        stride_bt,
++        max_blocks,
++        qstart_ptr,
++        scale,
++        toff,
++        coff,
++        t_mask,
++        c_mask,
++        W,
++        dyn_ptr=None,
++        CACHE_FIRST=True,
++    ).to(out_ptr.dtype.element_ty)
++    offs = toff[:, None] * C + coff[None, :]
++    mask = t_mask[:, None] & c_mask[None, :]
++    if HAS_ADDEND:
++        acc = tl.load(addend_ptr + offs, mask, other=0).to(tl.float32)
++        if HAS_RES:
++            acc = tl.load(res_ptr + offs, mask, other=0).to(tl.float32) + acc
++        y = (acc + y.to(tl.float32)).to(out_ptr.dtype.element_ty)
++    tl.store(out_ptr + offs, y, mask=mask)
++
++
++@triton.jit
++def _conv_mix_kernel(
++    x_ptr,
++    cache_ptr,
++    weight_ptr,
++    out_ptr,
++    res_ptr,
++    addend_ptr,
++    pos_ptr,
++    seq_idx_ptr,
++    slot_ptr,
++    block_table_ptr,
++    qstart_ptr,
++    Stack,
++    Last,
++    Queries,
++    NormW,
++    Mix,
++    Counter,
++    T,
++    stride_x,
++    stride_c_blk,
++    stride_c_h,
++    stride_c_n,
++    stride_w0,
++    stride_w1,
++    stride_bt,
++    max_blocks,
++    N,
++    scale,
++    stride_s,
++    eps,
++    norm_eps,
++    W: tl.constexpr,
++    OFF: tl.constexpr,
++    WS: tl.constexpr,
++    H: tl.constexpr,
++    HAS_RES: tl.constexpr,
++    HAS_ADDEND: tl.constexpr,
++    N_STACK: tl.constexpr,
++    HAS_LAST: tl.constexpr,
++    NORMALIZE: tl.constexpr,
++    APPLY_NORM: tl.constexpr,
++    NUM_Q: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    BLOCK_A: tl.constexpr,
++    BLOCK_B: tl.constexpr,
++    BLOCK_C: tl.constexpr,
++):
++    """One token's BLOCK_C columns of the short conv (written to `out_ptr`);
++    the token's last program then computes its AttnRes mixes with every
++    query, read back from `out_ptr` as the row kernel reads them, so both
++    match `short_conv` + `attn_res` bit for bit."""
++    t = tl.program_id(0)
++    toff = t + tl.arange(0, 1)
++    conv = (
++        x_ptr,
++        cache_ptr,
++        weight_ptr,
++        out_ptr,
++        res_ptr,
++        addend_ptr,
++        pos_ptr,
++        seq_idx_ptr,
++        slot_ptr,
++        block_table_ptr,
++        qstart_ptr,
++        T,
++        stride_x,
++        stride_c_blk,
++        stride_c_h,
++        stride_c_n,
++        stride_w0,
++        stride_w1,
++        stride_bt,
++        max_blocks,
++        N,
++        scale,
++        toff,
++    )
++    # (Constexprs passed one by one: a tuple of them loses constexpr-ness.)
++    coff = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
++    _conv_mix_part(*conv, coff, W, OFF, WS, H, HAS_RES, HAS_ADDEND)
++    # The last of the token's column programs to finish mixes the row: its
++    # threads' stores are complete before the (release) count, the others'
++    # are visible after the (acquire) count and read past the per-CU cache.
++    tl.debug_barrier()
++    done = tl.atomic_add(Counter + t, 1, sem="acq_rel")
++    if done != tl.num_programs(1) - 1:
++        return
++    # Reset for the next launch (graph replays included).
++    tl.store(Counter + t, 0)
++    if HAS_LAST:
++        last, addend = Last, out_ptr
++    else:
++        last, addend = out_ptr, out_ptr
++    for q in tl.static_range(NUM_Q):
++        _row_mix(
++            Stack,
++            last,
++            addend,
++            Queries,
++            NormW,
++            Mix,
++            stride_s,
++            T,
++            eps,
++            norm_eps,
++            t.to(tl.int64),
++            q,
++            H * WS,
++            N_STACK,
++            HAS_LAST,
++            NORMALIZE,
++            APPLY_NORM,
++            BLOCK_N,
++            BLOCK_A,
++            BLOCK_B,
++            LAST_CG=True,
++        )
++
++
++_COUNTERS: dict[torch.device, torch.Tensor] = {}
++
++
++def _token_counters(device: torch.device) -> torch.Tensor:
++    """Per-token arrival counts of `_conv_mix_kernel`'s column programs;
++    zero between launches (each token's last program resets its count)."""
++    counters = _COUNTERS.get(device)
++    if counters is None:
++        counters = torch.zeros(ROW_MAX_PROGRAMS, dtype=torch.int32, device=device)
++        _COUNTERS[device] = counters
++    return counters
++
++
++def conv_mix(
++    x: torch.Tensor,
++    conv_weight: torch.Tensor,
++    cache: torch.Tensor,
++    positions: torch.Tensor,
++    block_table: torch.Tensor,
++    seq_idx: torch.Tensor,
++    slot_mapping: torch.Tensor,
++    query_start: torch.Tensor,
++    stream_offset: int,
++    stream_width: int,
++    conv_out: torch.Tensor,
++    residual: torch.Tensor | None,
++    addend: torch.Tensor | None,
++    stack: torch.Tensor,
++    last: torch.Tensor | None,
++    queries: torch.Tensor,
++    norm_weight: torch.Tensor | None,
++    norm_eps: float,
++    eps: float = 1e-6,
++) -> torch.Tensor:
++    """`short_conv` of `x` into `conv_out` (with the optional `(residual +
++    addend) + y` update), then `attn_res` over `[*stack, (last +) conv_out]`
++    with each query, normalized values: the `(Q, T, D)` mixes in bf16, or
++    fp32 without `norm_weight` (the NVIDIA `conv_mix` interface).
++
++
++    Small batches run as one launch (a program per token), equal bit for bit
++    to `short_conv` then `attn_res`; larger ones run those two.
++    """
++    num_tokens, d = conv_out.shape
++    num_q = queries.shape[0]
++    if num_tokens == 0 or num_tokens * num_q > ROW_MAX_PROGRAMS:
++        conv = short_conv(
++            x,
++            conv_weight,
++            cache,
++            positions,
++            block_table,
++            seq_idx,
++            slot_mapping,
++            query_start,
++            stream_offset,
++            stream_width,
++            addend,
++            residual,
++            conv_out,
++        )
++        return attn_res(
++            stack,
++            conv if last is None else last,
++            None if last is None else conv,
++            queries,
++            norm_weight,
++            norm_eps,
++            True,
++            eps,
++        )
++    assert x.stride(1) == 1 and cache.stride(3) == 1 and conv_out.is_contiguous()
++    assert x.shape == conv_out.shape
++    assert residual is None or addend is not None
++    for t in (addend, residual, last):
++        assert t is None or (t.is_contiguous() and t.shape == conv_out.shape)
++    assert stack.stride(1) == d and stack.stride(2) == 1
++    assert queries.dtype == torch.float32 and queries.is_contiguous()
++    num_heads = cache.shape[1]
++    assert d == num_heads * stream_width
++    width = conv_weight.shape[1]
++    apply_norm = norm_weight is not None
++    if norm_weight is None:
++        norm_weight = queries  # unread
++    assert norm_weight.shape == queries.shape and norm_weight.is_contiguous()
++    out_dtype = conv_out.dtype if apply_norm else torch.float32
++    mixes = torch.empty((num_q, num_tokens, d), dtype=out_dtype, device=x.device)
++    block_a, block_b = row_blocks(d)
++    num_stack = stack.shape[0]
++    block_c = 256
++    _conv_mix_kernel[(num_tokens, triton.cdiv(d, block_c))](
++        x,
++        cache,
++        conv_weight,
++        conv_out,
++        residual,
++        addend,
++        positions,
++        seq_idx,
++        slot_mapping,
++        block_table,
++        query_start,
++        stack,
++        last,
++        queries,
++        norm_weight,
++        mixes,
++        _token_counters(x.device),
++        num_tokens,
++        x.stride(0),
++        cache.stride(0),
++        cache.stride(1),
++        cache.stride(2),
++        conv_weight.stride(0),
++        conv_weight.stride(1),
++        block_table.stride(0),
++        block_table.shape[1],
++        cache.shape[2],
++        (width + 1) ** -0.5,
++        stack.stride(0),
++        eps,
++        norm_eps,
++        W=width,
++        OFF=stream_offset,
++        WS=stream_width,
++        H=num_heads,
++        HAS_RES=residual is not None,
++        HAS_ADDEND=addend is not None,
++        N_STACK=num_stack,
++        HAS_LAST=last is not None,
++        NORMALIZE=True,
++        APPLY_NORM=apply_norm,
++        NUM_Q=num_q,
++        BLOCK_N=triton.next_power_of_2(num_stack + 1),
++        BLOCK_A=block_a,
++        BLOCK_B=block_b,
++        BLOCK_C=block_c,
++        num_warps=8,
++        enable_fp_fusion=False,
++    )
++    return mixes
++
++
+ # Columns of shift_rel_proj beyond the extent, 256 on either side.
+ _SHIFT_PAD = 512
+ 
+@@ -737,6 +1082,10 @@ def _kv_conv_tile(
+         + head * stride_kv_h
+         + d_idx[None, :]
+     )
++    if cache.dtype.element_ty == tl.float8e4nv:
++        # Unit-scale E4M3 KV: K is L2-clipped and V RMS-normalized, so the
++        # clamp to the E4M3 range never binds in practice.
++        y = tl.minimum(tl.maximum(y, -448.0), 448.0)
+     tl.store(dst, y.to(cache.dtype.element_ty), mask=(kv_slot >= 0)[:, None])
+ 
+ 
+diff --git a/vllm/models/inkling2/amd/ops/segment_gemv.py b/vllm/models/inkling2/amd/ops/segment_gemv.py
+new file mode 100644
+index 0000000000..69407a3a14
+--- /dev/null
++++ b/vllm/models/inkling2/amd/ops/segment_gemv.py
+@@ -0,0 +1,119 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Several one-row GEMVs with their own inputs and weights in one launch.
++
++Batch-1 decode projects a full (or looped) layer's query side, K and V and
++the K/V convs' dynamic taps from up to three inputs: five small GEMVs whose
++launch gaps cost about as much as their weight reads. `segment_gemv` runs
++them as one grid, each program one `ops.linear.gemv` tile of one segment
++with that GEMV's own tile shape, so every output equals its `gemv` bit for
++bit.
++"""
++
++import torch
++
++from vllm.triton_utils import tl, triton
++
++from .linear import _gemv_config
++
++MAX_SEGMENTS = 5
++
++
++@triton.jit
++def _gemv_tile(
++    X, W, Y, N, stride_wn, pid, K: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr
++):
++    # `ops.linear._gemv_kernel` for one stream.
++    rows = pid * BN + tl.arange(0, BN)
++    w_rows = W + rows[:, None].to(tl.int64) * stride_wn
++    acc = tl.zeros((BN, BK), tl.float32)
++    for k0 in tl.static_range(0, K, BK):
++        ks = k0 + tl.arange(0, BK)
++        x = tl.load(X + ks, ks < K, other=0)
++        w = tl.load(
++            w_rows + ks[None, :], (rows[:, None] < N) & (ks[None, :] < K), other=0
++        )
++        acc += w.to(tl.float32) * x.to(tl.float32)[None, :]
++    tl.store(Y + rows, tl.sum(acc, 1).to(Y.dtype.element_ty), rows < N)
++
++
++@triton.jit
++def _segment_gemv_kernel(
++    X0, W0, Y0, N0, S0,
++    X1, W1, Y1, N1, S1,
++    X2, W2, Y2, N2, S2,
++    X3, W3, Y3, N3, S3,
++    X4, W4, Y4, N4, S4,
++    K: tl.constexpr,
++    BK: tl.constexpr,
++    NUM_SEG: tl.constexpr,
++    BN0: tl.constexpr, BN1: tl.constexpr, BN2: tl.constexpr,
++    BN3: tl.constexpr, BN4: tl.constexpr,
++    END0: tl.constexpr, END1: tl.constexpr, END2: tl.constexpr,
++    END3: tl.constexpr,
++):  # fmt: skip
++    # Programs [END_{i-1}, END_i) are segment i's tiles.
++    pid = tl.program_id(0)
++    if pid < END0:
++        _gemv_tile(X0, W0, Y0, N0, S0, pid, K, BN0, BK)
++    elif NUM_SEG > 1 and pid < END1:
++        _gemv_tile(X1, W1, Y1, N1, S1, pid - END0, K, BN1, BK)
++    elif NUM_SEG > 2 and pid < END2:
++        _gemv_tile(X2, W2, Y2, N2, S2, pid - END1, K, BN2, BK)
++    elif NUM_SEG > 3 and pid < END3:
++        _gemv_tile(X3, W3, Y3, N3, S3, pid - END2, K, BN3, BK)
++    elif NUM_SEG > 4:
++        _gemv_tile(X4, W4, Y4, N4, S4, pid - END3, K, BN4, BK)
++
++
++def segment_gemv(
++    pairs: list[tuple[torch.Tensor, torch.Tensor]],
++) -> list[torch.Tensor] | None:
++    """`[gemv(x, w) for x, w in pairs]` in one launch: bf16 `(1, K)` inputs
++    and `(N, K)` weights (rows contiguous along K) with the same K.
++
++    Returns None (the caller runs the GEMVs one by one) when the GEMVs'
++    configs need different `BK` or warp counts.
++    """
++    assert 0 < len(pairs) <= MAX_SEGMENTS
++    k = pairs[0][1].shape[1]
++    configs = []
++    for x, w in pairs:
++        assert x.shape == (1, k) and w.shape[1] == k
++        assert x.dtype == w.dtype == torch.bfloat16
++        assert x.stride(-1) == 1 and w.stride(-1) == 1
++        configs.append(_gemv_config(1, w.shape[0], k))
++    if len({(bk, warps) for _, bk, warps in configs}) != 1:
++        return None
++    bk, num_warps = configs[0][1:]
++    outs = [x.new_empty((1, w.shape[0])) for x, w in pairs]
++    args: list = []
++    bns, ends = [], []
++    end = 0
++    for (x, w), y, (bn, _, _) in zip(pairs, outs, configs):
++        args += [x, w, y, w.shape[0], w.stride(0)]
++        bns.append(bn)
++        end += triton.cdiv(w.shape[0], bn)
++        ends.append(end)
++    for _ in range(MAX_SEGMENTS - len(pairs)):
++        # Unused segments: never read.
++        args += [*args[:2], args[2], 0, 0]
++        bns.append(1)
++        ends.append(end)
++    _segment_gemv_kernel[(end,)](
++        *args,
++        K=k,
++        BK=bk,
++        NUM_SEG=len(pairs),
++        BN0=bns[0],
++        BN1=bns[1],
++        BN2=bns[2],
++        BN3=bns[3],
++        BN4=bns[4],
++        END0=ends[0],
++        END1=ends[1],
++        END2=ends[2],
++        END3=ends[3],
++        num_warps=num_warps,
++    )
++    return outs
+diff --git a/vllm/models/inkling2/amd/ops/triton_bmm.py b/vllm/models/inkling2/amd/ops/triton_bmm.py
+index 77d21d60f3..8bf4f65565 100644
+--- a/vllm/models/inkling2/amd/ops/triton_bmm.py
++++ b/vllm/models/inkling2/amd/ops/triton_bmm.py
+@@ -1,7 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Triton MXFP8 batched expert GEMMs (`tl.dot_scaled`: gfx950's scaled MFMA)
+-for the Inkling2 MoE.
++"""Triton MXFP8 batched expert GEMMs for the Inkling2 MoE: `tl.dot_scaled`
++(gfx950's scaled MFMA) or, on gfx12 (RDNA4: no scaled WMMA), fp8 WMMA per
++32-wide K group with the block scales applied to the fp32 partial sums.
+ 
+ The GEMMs read expert-sorted activation rows whose expert segments are padded
+ to the token tile, with block scales in the R8c4 (tile < 128) or R128c4 layout
+@@ -99,6 +100,135 @@ def _mxfp8_bmm_kernel(
+     tl.store(out_ptrs, acc.to(tl.bfloat16), row_mask)
+ 
+ 
++@triton.jit
++def _e8m0_to_f32(e):
++    """2^(e - 127) exactly (e = 0: the fp32 subnormal 2^-127; 255: NaN)."""
++    e = e.to(tl.int32)
++    bits = tl.where(e == 0, 0x00400000, e << 23)
++    bits = tl.where(e == 255, 0x7FC00000, bits)
++    return bits.to(tl.float32, bitcast=True)
++
++
++@triton.jit
++def _mxfp8_bmm_wmma_kernel(
++    A,
++    AScale,
++    W,
++    WScale,
++    Out,
++    Tiles,
++    max_ctas,
++    N: tl.constexpr,
++    K: tl.constexpr,
++    TILE: tl.constexpr,
++    BM: tl.constexpr,
++    BN: tl.constexpr,
++    BK: tl.constexpr,
++):
++    # `_mxfp8_bmm_kernel` without scaled dots: one fp8 x fp8 -> fp32 dot per
++    # 32-wide K group (its scale block), scaled by the outer product of the
++    # row and column scales and accumulated in fp32. BK (a multiple of 32) is
++    # the K step of the loop; its groups are unrolled.
++    SUB: tl.constexpr = TILE // BM if TILE >= BM else 1
++    pid_m = tl.program_id(1)
++    tile = pid_m // SUB
++    if tile >= tl.load(Tiles + 2 * max_ctas):
++        return
++    row_end = tl.load(Tiles + max_ctas + tile)
++    row0 = tile * TILE + (pid_m % SUB) * BM
++    if row0 >= row_end:
++        return
++    expert = tl.load(Tiles + tile).to(tl.int64)
++    rows = row0 + tl.arange(0, BM)
++    in_tile = rows < row_end
++    cols = tl.program_id(0) * BN + tl.arange(0, BN)
++    ks = tl.arange(0, 32)
++    a_ptrs = A + rows[:, None].to(tl.int64) * K + ks[None, :]
++    w_ptrs = W + (expert * N + cols[None, :]) * K + ks[:, None]
++    ws_ptrs = WScale + (expert * N + cols) * (K // 32)
++    acc = tl.zeros((BM, BN), tl.float32)
++    for k in range(0, K, BK):
++        for g in tl.static_range(BK // 32):
++            kg = k + g * 32
++            a = tl.load(a_ptrs + kg, in_tile[:, None], other=0.0)
++            w = tl.load(w_ptrs + kg)
++            a_scale = tl.load(
++                AScale + _scale_offsets(rows, kg // 32, K // 32, TILE),
++                in_tile,
++                other=127,
++            )
++            w_scale = tl.load(ws_ptrs + kg // 32)
++            part = tl.dot(a, w)
++            scale = _e8m0_to_f32(a_scale)[:, None] * _e8m0_to_f32(w_scale)[None, :]
++            acc += part * scale
++    out_ptrs = Out + rows[:, None].to(tl.int64) * N + cols[None, :]
++    tl.store(out_ptrs, acc.to(tl.bfloat16), in_tile[:, None])
++
++
++@dataclass(frozen=True)
++class BmmConfig:
++    """Launch config of the expert GEMM: a BM x BN output block per program
++    (BM divides the token tile or covers it), BK-deep K steps."""
++
++    bm: int
++    bn: int
++    bk: int
++    num_warps: int
++    num_stages: int
++    # Matrix instruction size (16: WMMA/MFMA 16x16); None keeps Triton's choice.
++    matrix_instr_nonkdim: int | None = None
++    # fp8 WMMA per scale group (`_mxfp8_bmm_wmma_kernel`), not `tl.dot_scaled`.
++    wmma: bool = False
++
++
++def _gfx950_config(tile: int, n: int, k: int) -> BmmConfig:
++    # MI355 (160 KiB LDS, 64-lane waves): single-buffered 128 x 128 x 256 fp8
++    # tiles for 64+ row token tiles.
++    bm = min(max(tile, 16), 128)
++    bn = 128 if n % 128 == 0 else 64
++    bk = 256 if k % 256 == 0 and bm >= 64 else 128
++    num_warps = 8 if bm == 128 and bk == 256 else 4
++    return BmmConfig(bm, bn, bk, num_warps, 2)
++
++
++# gfx12 (RDNA4: 64 KiB LDS, 32-lane waves, WMMA 16x16x16 without scaled
++# variants) by token tile: (BM, BN, BK, num_warps, num_stages), from a sweep
++# on the R9700 (gfx1201) of Inkling-2-Mini's MXFP8 experts (128 experts,
++# top-8, [2304, 2304] and [2304, 1152]) at 1-4096 tokens. Decode tiles (16)
++# are bandwidth bound; 64+ row tiles reach ~34 (512 tokens) and ~69 TFLOP/s
++# (4096 tokens), vs ~10 TFLOP/s for `tl.dot_scaled`, which gfx12 lowers to
++# bf16 WMMA plus a vector dequant of both operands.
++_GFX12_CONFIGS = {
++    16: (16, 64, 128, 4, 3),
++    32: (32, 128, 64, 8, 3),
++    64: (64, 128, 64, 8, 3),
++    128: (64, 256, 32, 8, 3),
++    256: (64, 256, 32, 8, 3),
++}
++
++
++def _gfx12_config(tile: int, n: int, k: int) -> BmmConfig:
++    bm, bn, bk, num_warps, num_stages = _GFX12_CONFIGS[min(max(tile, 16), 256)]
++    while n % bn:
++        bn //= 2
++    while k % bk:
++        bk //= 2
++    assert bn >= 16 and bk >= 32, (n, k)
++    return BmmConfig(bm, bn, bk, num_warps, num_stages, 16, wmma=True)
++
++
++@functools.cache
++def bmm_config(tile: int, n: int, k: int) -> BmmConfig:
++    """Launch config for token tiles of `tile` rows and `[N, K]` experts on
++    this GPU."""
++    from vllm.platforms.rocm import on_gfx12x
++
++    config = (_gfx12_config if on_gfx12x() else _gfx950_config)(tile, n, k)
++    assert n % config.bn == 0 and k % config.bk == 0, (config, n, k)
++    assert config.bm >= tile or tile % config.bm == 0, (config, tile)
++    return config
++
++
+ def bmm(
+     act: torch.Tensor,
+     act_scale: torch.Tensor,
+@@ -106,23 +236,27 @@ def bmm(
+     weight_scale: torch.Tensor,
+     tiles: torch.Tensor,
+     plan: ExpertPlan,
++    config: BmmConfig | None = None,
+ ) -> torch.Tensor:
+     """bf16 `[plan.rows, N]` expert GEMM of the tile-padded MXFP8 `act` rows
+     with their swizzled block scales `act_scale`, by each tile's expert
+     (`tiles`: the `moe.route` metadata). Rows past each tile's routed rows
+-    are left uninitialized."""
++    are left uninitialized. `config` overrides `bmm_config` (tuning)."""
+     num_experts, n, k = weight.shape
+     assert act.shape == (plan.rows, k) and weight.dtype == torch.float8_e4m3fn
+     assert weight_scale.shape == (num_experts, n, k // 32)
+     assert weight.is_contiguous() and weight_scale.is_contiguous()
+     out = torch.empty((plan.rows, n), dtype=torch.bfloat16, device=act.device)
+     tile = plan.tile
+-    bm = min(max(tile, 16), 128)
+-    bn = 128 if n % 128 == 0 else 64
+-    bk = 256 if k % 256 == 0 and bm >= 64 else 128
+-    assert n % bn == 0 and k % bk == 0
++    if config is None:
++        config = bmm_config(tile, n, k)
++    bm = config.bm
+     sub = tile // bm if tile >= bm else 1
+-    _mxfp8_bmm_kernel[(n // bn, plan.max_ctas * sub)](
++    extra = {}
++    if config.matrix_instr_nonkdim is not None:
++        extra["matrix_instr_nonkdim"] = config.matrix_instr_nonkdim
++    kernel = _mxfp8_bmm_wmma_kernel if config.wmma else _mxfp8_bmm_kernel
++    kernel[(n // config.bn, plan.max_ctas * sub)](
+         act,
+         act_scale,
+         weight,
+@@ -134,9 +268,10 @@ def bmm(
+         K=k,
+         TILE=tile,
+         BM=bm,
+-        BN=bn,
+-        BK=bk,
+-        num_warps=8 if bm == 128 and bk == 256 else 4,
+-        num_stages=2,
++        BN=config.bn,
++        BK=config.bk,
++        num_warps=config.num_warps,
++        num_stages=config.num_stages,
++        **extra,
+     )
+     return out
+diff --git a/vllm/models/inkling2/amd/quant_config.py b/vllm/models/inkling2/amd/quant_config.py
+index eadf27c9ff..d047716623 100644
+--- a/vllm/models/inkling2/amd/quant_config.py
++++ b/vllm/models/inkling2/amd/quant_config.py
+@@ -1,64 +1,107 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Per-tensor precision metadata of Inkling2 checkpoints (hf_quant_config.json).
++"""Per-tensor precision metadata of Inkling2 checkpoints (hf_quant_config.json)
++on ROCm.
+ 
+-Only the routed experts are quantized (NVFP4 or MXFP8); they are handled by
+-`Inkling2MoE`, which runs MXFP8 experts only. Every other layer runs
+-unquantized.
++Only the routed experts are quantized: NVFP4 (e2m1 values, e4m3 scales per 16,
++per-expert `amax` over a per-tensor denominator) or MXFP8 (e4m3 values, ue8m0
++scales per 32). `Inkling2MoE` runs either format on the checkpoint's tensors as
++stored; `expert_format` gives each layer's. Every other tensor is a plain
++float32 or bfloat16 cast and runs unquantized, as does the DSpark drafter
++(`mtp` section).
+ """
+ 
+ from __future__ import annotations
+ 
+-from typing import Any
++import re
++from typing import Any, Literal
+ 
+-import torch
++from vllm.models.inkling2.quant_config import (
++    Inkling2QuantConfig as _SharedInkling2QuantConfig,
++)
++
++QuantFormat = Literal["nvfp4", "mxfp8"]
+ 
+-from vllm.model_executor.layers.quantization import QuantizationMethods
+-from vllm.model_executor.layers.quantization.base_config import (
+-    QuantizationConfig,
+-    QuantizeMethodBase,
++_CAST_DTYPES = ("float32", "bfloat16")
++_EXPERT_FORMATS: tuple[QuantFormat, ...] = ("nvfp4", "mxfp8")
++_EXPERT_WEIGHT = re.compile(
++    r"^model\.llm\.layers\.(\d+)\.mlp\.experts\.(w13|w2)_weight$"
+ )
+ 
+-_COMPUTE_DTYPES = ("float32", "bfloat16", "mxfp8", "nvfp4")
+ 
++class Inkling2QuantConfig(_SharedInkling2QuantConfig):
++    """The shared config (name `inkling2`, the ModelOpt / FP8 override of
++    released checkpoints, `is_mxfp8_layer`) plus the parsed parameter groups
++    of the model and the `mtp` drafter."""
+ 
+-class Inkling2QuantConfig(QuantizationConfig):
+     def __init__(self, config: dict[str, Any]) -> None:
+-        super().__init__()
+-        self.mxfp8_weights: set[str] = set()
+-        for group in config["model"]["parameter_groups"]:
++        super().__init__(config)
++        # Compute dtype of every listed tensor (`model` section).
++        self.tensor_dtypes = self._parse_groups(config["model"]["parameter_groups"])
++        # Tensors whose forward output is float32 (the unembedding).
++        self.fp32_output_tensors = {
++            name
++            for group in config["model"]["parameter_groups"]
++            if group.get("fwd_output_dtype") == "float32"
++            for name in group["tensors"]
++        }
++        mtp = config.get("mtp")
++        self.mtp_tensor_dtypes = (
++            {} if mtp is None else self._parse_groups(mtp["parameter_groups"])
++        )
++        if any(d not in _CAST_DTYPES for d in self.mtp_tensor_dtypes.values()):
++            raise ValueError("Inkling2 DSpark (mtp) tensors must be unquantized")
++        # Expert format of each layer listing quantized expert weights; both
++        # projections of a layer must agree.
++        self.expert_formats: dict[int, QuantFormat] = {}
++        for name, dtype in self.tensor_dtypes.items():
++            m = _EXPERT_WEIGHT.match(name)
++            if m is None:
++                if dtype in _EXPERT_FORMATS:
++                    raise ValueError(f"Inkling2 quantizes routed experts only: {name}")
++                continue
++            if dtype not in _EXPERT_FORMATS:
++                raise ValueError(f"Unquantized Inkling2 experts: {name} ({dtype})")
++            layer = int(m.group(1))
++            if self.expert_formats.setdefault(layer, dtype) != dtype:
++                raise ValueError(
++                    f"Inkling2 layer {layer} mixes {self.expert_formats[layer]} "
++                    f"and {dtype} experts"
++                )
++
++    @staticmethod
++    def _parse_groups(groups: list[dict[str, Any]]) -> dict[str, str]:
++        dtypes: dict[str, str] = {}
++        for group in groups:
+             compute = group["compute_dtype"]
+-            if compute not in _COMPUTE_DTYPES:
++            if compute not in (*_CAST_DTYPES, *_EXPERT_FORMATS):
+                 raise ValueError(f"Unsupported Inkling2 compute dtype: {compute}")
+-            if compute == "mxfp8":
+-                self.mxfp8_weights.update(group["tensors"])
+-
+-    @classmethod
+-    def get_name(cls) -> QuantizationMethods:
+-        return "inkling2"
+-
+-    @classmethod
+-    def get_supported_act_dtypes(cls) -> list[torch.dtype]:
+-        return [torch.bfloat16]
++            for name in group["tensors"]:
++                if dtypes.setdefault(name, compute) != compute:
++                    raise ValueError(
++                        f"Inkling2 tensor {name} is in two parameter groups "
++                        f"({dtypes[name]}, {compute})"
++                    )
++        return dtypes
+ 
+     @classmethod
+     def get_min_capability(cls) -> int:
+-        # The MXFP8 experts run on gfx950's scaled MFMA.
++        # gfx950 (9.5) runs both formats on scaled MFMA; gfx12 (12.0, RDNA4)
++        # through `amd/ops` Triton GEMMs.
+         return 95
+ 
+-    @staticmethod
+-    def get_config_filenames() -> list[str]:
+-        return ["hf_quant_config.json"]
+-
+     @classmethod
+     def from_config(cls, config: dict[str, Any]) -> Inkling2QuantConfig:
+         return cls(config)
+ 
+-    def get_quant_method(
+-        self, layer: torch.nn.Module, prefix: str
+-    ) -> QuantizeMethodBase | None:
+-        return None
++    def expert_format(self, layer_id: int) -> QuantFormat:
++        """Format of layer `layer_id`'s routed experts (`Inkling2MoE`)."""
++        if layer_id not in self.expert_formats:
++            raise ValueError(
++                f"hf_quant_config.json lists no quantized experts for Inkling2 "
++                f"layer {layer_id}; ROCm runs NVFP4 or MXFP8 experts only"
++            )
++        return self.expert_formats[layer_id]
+ 
+-    def is_mxfp8_layer(self, layer_id: int) -> bool:
+-        name = f"model.llm.layers.{layer_id}.mlp.experts.w13_weight"
+-        return name in self.mxfp8_weights
++    def is_nvfp4_layer(self, layer_id: int) -> bool:
++        return self.expert_formats.get(layer_id) == "nvfp4"
+diff --git a/vllm/models/inkling2/amd/sconv.py b/vllm/models/inkling2/amd/sconv.py
+index 9cedd831e0..83b47d949d 100644
+--- a/vllm/models/inkling2/amd/sconv.py
++++ b/vllm/models/inkling2/amd/sconv.py
+@@ -8,11 +8,12 @@ are TP-sharded with the KV heads; the attn-/mlp-output streams are replicated
+ full-width on every rank.
+ """
+ 
+-from typing import cast
++from typing import ClassVar, cast
+ 
+ import torch
+ from torch import nn
+ 
++from vllm.config import VllmConfig
+ from vllm.distributed import (
+     get_tensor_model_parallel_rank,
+     get_tensor_model_parallel_world_size,
+@@ -23,9 +24,12 @@ from vllm.models.inkling.amd.sconv_swa_attn import (
+     InklingConvState,
+     InklingSconvMetadata,
+ )
++from vllm.v1.core.single_type_kv_cache_manager import TailSlidingWindowManager
++from vllm.v1.kv_cache_interface import KVCacheLayerConfig
+ 
+-from .ops.linear import linear_k_groups
+-from .ops.sconv import short_conv
++from .ops.attn_res import attn_res
++from .ops.linear import decode_linear, linear_k_groups
++from .ops.sconv import conv_mix, short_conv
+ 
+ K_STREAM, V_STREAM, ATTN_STREAM, MLP_STREAM = range(4)
+ 
+@@ -40,6 +44,28 @@ class Inkling2ConvState(InklingConvState):
+         tp_size = get_tensor_model_parallel_world_size()
+         super().__init__(hidden_size=hidden_size * tp_size, **kwargs)
+ 
++    # The conv kernels (`ops/sconv.py`) write every token's input to its slot
++    # but read from the cache only the `W - 1` taps before a step's first
++    # token, so the cache backs only each step's tail: the interior of a
++    # prefill chunk writes to the null block. False keeps a whole window per
++    # in-flight chunk (the plain sliding-window manager).
++    tail_only: ClassVar[bool] = True
++
++    def get_kv_cache_config(self, vllm_config: VllmConfig) -> KVCacheLayerConfig:
++        config = super().get_kv_cache_config(vllm_config)
++        if not self.tail_only:
++            return config
++        # A step reads the window before its first token, which rejected
++        # drafts of the in-flight steps can move back by up to
++        # num_speculative_tokens each.
++        return TailSlidingWindowManager.layer_config(
++            config.spec,
++            sliding_window=self.sliding_window,
++            num_speculative_tokens=vllm_config.num_speculative_tokens,
++            max_in_flight_steps=vllm_config.max_concurrent_batches,
++            num_lookahead_tokens=vllm_config.num_lookahead_tokens,
++        )
++
+ 
+ def conv_metadata(owner: InklingConvState) -> InklingSconvMetadata | None:
+     attn_metadata = get_forward_context().attn_metadata
+@@ -104,18 +130,22 @@ class Inkling2ShortConv(nn.Module):
+         """Static `(dim, W)` taps, or `(W, dim)` static part of dynamic taps."""
+         return self.static_w if self.dynamic else self.weight.squeeze(1)
+ 
++    @property
++    def dynamic_taps_gemv(self) -> bool:
++        """Whether `dynamic_taps` is a plain `decode_linear`."""
++        # Same dispatch as the reference ``linear``: fp32 1024-wide K groups.
++        return not (
++            self.weight_proj.shape[1] >= 2560
++            and self.weight_proj.shape[0] not in (1, 2, 4)
++        )
++
+     def dynamic_taps(self, x: torch.Tensor) -> torch.Tensor | None:
+         """Per-token tap deltas `(T, num_heads * W)` projected from `x`."""
+         if not self.dynamic:
+             return None
+-        # Same dispatch as the reference ``linear``: fp32 1024-wide K groups.
+-        if self.weight_proj.shape[1] >= 2560 and self.weight_proj.shape[0] not in (
+-            1,
+-            2,
+-            4,
+-        ):
++        if not self.dynamic_taps_gemv:
+             return linear_k_groups(x.contiguous(), self.weight_proj, x.dtype)
+-        return nn.functional.linear(x, self.weight_proj)
++        return decode_linear(x, self.weight_proj)
+ 
+     def forward(
+         self,
+@@ -124,22 +154,26 @@ class Inkling2ShortConv(nn.Module):
+         addend: torch.Tensor | None = None,
+         residual: torch.Tensor | None = None,
+         out: torch.Tensor | None = None,
++        owner: InklingConvState | None = None,
+     ) -> torch.Tensor:
+         """Static conv of `x`; with `addend`, returns `(residual + addend)
+-        + conv(x)` accumulated in fp32 (written to `out` if given)."""
++        + conv(x)` accumulated in fp32 (written to `out` if given). `owner`
++        overrides the conv-state cache (a loop pass after the first)."""
+         assert not self.dynamic
+-        m = conv_metadata(self.owner)
++        if owner is None:
++            owner = self.owner
++        m = conv_metadata(owner)
+         if m is None:
+             # No conv state (profile run): skip the conv, keep the residual sum.
+             if addend is not None:
+                 acc = addend.float() if residual is None else residual + addend.float()
+                 x = (acc + x.to(addend.dtype).float()).to(addend.dtype)
+             return x if out is None else out.copy_(x)
+-        offset, width = self.owner.stream_ranges[self.stream]
++        offset, width = owner.stream_ranges[self.stream]
+         return short_conv(
+             x,
+             self.conv_weight,
+-            self.owner.kv_cache,
++            owner.kv_cache,
+             positions,
+             m.block_table,
+             m.seq_idx,
+@@ -151,3 +185,59 @@ class Inkling2ShortConv(nn.Module):
+             residual,
+             out,
+         )
++
++    def conv_mix(
++        self,
++        x: torch.Tensor,
++        positions: torch.Tensor,
++        out: torch.Tensor,
++        stack: torch.Tensor,
++        last: torch.Tensor | None,
++        queries: torch.Tensor,
++        norm: nn.Module | None,
++        addend: torch.Tensor | None = None,
++        residual: torch.Tensor | None = None,
++        owner: InklingConvState | None = None,
++    ) -> torch.Tensor:
++        """Convolve `x` into `out` like `forward` and return the AttnRes
++        mixes of `[*stack, (last +) out]` with `queries` through `norm` (the
++        fp32 mixes without it): the NVIDIA `conv_mix` interface, one launch
++        for small batches."""
++        assert not self.dynamic
++        if owner is None:
++            owner = self.owner
++        m = conv_metadata(owner)
++        if m is not None:
++            offset, width = owner.stream_ranges[self.stream]
++            return conv_mix(
++                x,
++                self.conv_weight,
++                owner.kv_cache,
++                positions,
++                m.block_table,
++                m.seq_idx,
++                m.slot_mapping,
++                m.query_start,
++                offset,
++                width,
++                out,
++                residual,
++                addend,
++                stack,
++                last,
++                queries,
++                None if norm is None else norm.weight,
++                0.0 if norm is None else norm.eps,
++            )
++        conv = self(
++            x, positions, addend=addend, residual=residual, out=out, owner=owner
++        )
++        return attn_res(
++            stack,
++            conv if last is None else last,
++            None if last is None else conv,
++            queries,
++            None if norm is None else norm.weight,
++            0.0 if norm is None else norm.eps,
++            True,
++        )
+diff --git a/vllm/models/inkling2/speculator.py b/vllm/models/inkling2/speculator.py
+index 6beae2b0d5..181925aad1 100644
+--- a/vllm/models/inkling2/speculator.py
++++ b/vllm/models/inkling2/speculator.py
+@@ -18,7 +18,7 @@ class Inkling2DSparkSpeculator(DSparkSpeculator):
+         super().__init__(vllm_config, device)
+         config = self.draft_model_config.hf_config
+         assert not self.sample_from_anchor
+-        assert self._draft_topk is None and not self.enable_adaptive_verification
++        assert self._draft_topk is None
+         self.hidden_states = torch.zeros(
+             self.max_num_tokens,
+             len(config.target_layer_ids) * config.hidden_size,
+@@ -70,6 +70,13 @@ class Inkling2DSparkSpeculator(DSparkSpeculator):
+         for i in range(n_spec):
+             state, bias = self.model.markov_step(state, prev, context[i])
+             if self.draft_logits is None:
++                if self.acceptance_estimator is not None:
++                    # Adaptive verification: the draft's top-token confidence
++                    # from the full softcapped logits.
++                    logits = self.model.markov_logits(base_logits[:, i], bias)
++                    self._maybe_predict_acceptance(
++                        logits, idx_map[:, i], self._step_cols[i]
++                    )
+                 prev = self.model.markov_argmax(base_logits[:, i], bias)
+             else:
+                 logits = self.model.markov_logits(base_logits[:, i], bias)
+diff --git a/vllm/models/inkling2/speculator_config.py b/vllm/models/inkling2/speculator_config.py
+index 0d367f8309..1daee38d8a 100644
+--- a/vllm/models/inkling2/speculator_config.py
++++ b/vllm/models/inkling2/speculator_config.py
+@@ -11,14 +11,57 @@ if TYPE_CHECKING:
+ 
+ class Inkling2DSparkSpeculatorConfig(DSparkSpeculatorConfig):
+     speculator_class = "vllm.models.inkling2.speculator.Inkling2DSparkSpeculator"
++    supported_options = DSparkSpeculatorConfig.supported_options | {
++        "speculator_options"
++    }
++
++    @classmethod
++    def apply_options(cls, spec: "SpeculativeConfig") -> None:
++        super().apply_options(spec)
++        options = dict(spec.speculator_options or {})
++        draft_context = options.pop("draft_context", None)
++        if options:
++            raise ValueError(
++                f"Unknown Inkling2 DSpark speculator_options: {sorted(options)}; "
++                "supported: ['draft_context']"
++            )
++        if draft_context is None:
++            return
++        if (
++            not isinstance(draft_context, int)
++            or isinstance(draft_context, bool)
++            or draft_context < 0
++        ):
++            raise ValueError(
++                f"draft_context must be a non-negative integer, got {draft_context!r}"
++            )
++        if draft_context and not current_platform.is_rocm():
++            raise ValueError(
++                "Inkling2 DSpark draft_context is implemented on ROCm only"
++            )
++        # The draft's global layer attends to the last `draft_context`
++        # positions before each block (0: the whole context). Verification
++        # stays exact, so this trades acceptance for draft KV memory only.
++        spec.draft_model_config.hf_config.draft_context = draft_context
+ 
+     @classmethod
+     def adapt_draft_model_config(cls, spec: "SpeculativeConfig") -> None:
+         super().adapt_draft_model_config(spec)
+-        if current_platform.is_device_capability_family(120):
++        if current_platform.is_rocm() or (
++            current_platform.is_cuda()
++            and current_platform.is_device_capability_family(120)
++        ):
+             # The target's clipped, unit-scale FP8 cache does not describe the
+-            # draft's unnormalized values. Keep the draft cache in BF16.
++            # draft's unnormalized values, so the draft cache defaults to BF16.
++            # On ROCm it may be unit-scale FP8 (E4M3) on request: the draft
++            # only proposes tokens, verification stays exact.
++            allowed = ("auto", "bfloat16")
++            if current_platform.is_rocm():
++                allowed += ("fp8", "fp8_e4m3")
+             if spec.kv_cache_dtype is None:
+                 spec.kv_cache_dtype = "auto"
+-            elif spec.kv_cache_dtype not in ("auto", "bfloat16"):
+-                raise ValueError("Inkling2 DSpark on SM12 requires BF16 draft KV")
++            elif spec.kv_cache_dtype not in allowed:
++                raise ValueError(
++                    f"Inkling2 DSpark draft KV must be one of {allowed}, got "
++                    f"{spec.kv_cache_dtype!r}"
++                )

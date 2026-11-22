@@ -1,0 +1,33 @@
+redshift patch: core/0104-gpu-runner-adaptive-verify-profile.patch
+cut from: b6faecc59a..93edd85693 -- vllm/v1/worker/gpu/model_runner.py
+commits:
+  d2632a0c6c Abhinand B: [S] Inkling2 ROCm: adaptive DSpark verification
+
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 1f831da6ff..9e1d02ae88 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1255,7 +1255,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             for batch in self.adaptive_verification.batches_to_profile(
+                 self.cudagraph_manager.captured_token_counts()
+             ):
+-                self._dummy_run(**batch, skip_eplb=True)
++                # Routed random ids: padding tokens skip the experts and
++                # all-zero ids all pick the same ones, either of which prices
++                # MoE verification far below real text.
++                self._dummy_run(**batch, skip_eplb=True, randomize_inputs=True)
+         self.adaptive_verification.set_initial_cost_curves(timings)
+ 
+     def _remove_request(self, req_id: str) -> bool:
+@@ -1990,8 +1993,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 self.input_buffers,
+                 max_query_len=batch_desc.max_query_len,
+                 # Profiling and warmup must route the dummy tokens to experts
+-                # so MoE memory is measured and MoE kernels are exercised.
+-                is_padding=not is_profile,
++                # so MoE memory is measured and MoE kernels are exercised;
++                # random ids are meant to spread them over the experts too.
++                is_padding=not (is_profile or randomize_inputs),
+             )
+             if randomize_inputs:
+                 # All-zero input_ids route every token to the same experts.

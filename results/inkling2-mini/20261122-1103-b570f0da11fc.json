@@ -1,0 +1,54 @@
+{
+ "meta": {
+  "image": "b570f0da11fc",
+  "patches": "upstream/0001-pr67685-inkling2-small-rocm.patch upstream/0002-pr69028-inkling2-mini.patch core/0101-rocm-rdna4-gpu-max-hw-queues.patch core/0102-config-gfx12-bringup.patch core/0103-v1-tail-sliding-window-manager.patch core/0104-gpu-runner-adaptive-verify-profile.patch model/0201-inkling2-amd-gfx1201.patch model/0202-inkling2-amd-tests.patch",
+  "vllm_commit": "bf151b7eb1403d3671200e0cd19ad9821fe4320f",
+  "kv_pool": "GPU KV cache size: 416,701 tokens, Maximum concurrency for 196,608 tokens per request: 2.12x"
+ },
+ "time": "2026-11-22 11:04",
+ "chat_391": true,
+ "tool_call": true,
+ "decode_story": {
+  "tokens": 512,
+  "ttft_s": 0.079,
+  "decode_tok_s": 78.7
+ },
+ "decode_code": {
+  "tokens": 512,
+  "ttft_s": 0.052,
+  "decode_tok_s": 91.3
+ },
+ "decode_explain": {
+  "tokens": 512,
+  "ttft_s": 0.076,
+  "decode_tok_s": 77.7
+ },
+ "prefill_4k": {
+  "prompt_tokens": 4103,
+  "ttft_s": 0.9,
+  "prefill_tok_s": 4581
+ },
+ "prefill_16k": {
+  "prompt_tokens": 16428,
+  "ttft_s": 3.74,
+  "prefill_tok_s": 4392
+ },
+ "prefill_64k": {
+  "prompt_tokens": 65608,
+  "ttft_s": 17.7,
+  "prefill_tok_s": 3707
+ },
+ "needles": [
+  {
+   "prompt_tokens": 191595,
+   "found": true,
+   "seconds": 155.2
+  },
+  {
+   "prompt_tokens": 191490,
+   "found": true,
+   "seconds": 90.5
+  }
+ ],
+ "needles_wall_s": 155.3
+}

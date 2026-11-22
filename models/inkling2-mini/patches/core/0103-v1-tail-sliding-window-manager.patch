@@ -1,0 +1,85 @@
+redshift patch: core/0103-v1-tail-sliding-window-manager.patch
+cut from: b6faecc59a..93edd85693 -- vllm/v1/core/single_type_kv_cache_manager.py
+commits:
+  d896b395af Abhinand B: [K] Inkling2 ROCm: tail-only conv-state cache manager
+
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index 84dfa53f19..15a9818fa7 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -1549,6 +1549,75 @@ class DFlashSlidingWindowManager(SlidingWindowManager):
+         return mask
+ 
+ 
++class TailSlidingWindowManager(DFlashSlidingWindowManager):
++    """Sliding-window cache read only before each step's first token.
++
++    For per-position caches like a short convolution's input history: a step
++    writes every token's slot but reads from the cache only the window before
++    its first token (in-step taps come from the step's own inputs). Like
++    `DFlashSlidingWindowManager`, an allocation backs only the blocks from
++    `num_tokens_main_model - tail_tokens` on, so the slots of a long chunk's
++    interior map to the null block, which nothing reads; one request holds
++    about one tail per in-flight step rather than the whole chunk.
++
++    Unlike DFlash, a prefix hit at `h` reads the window before `h`, so hits
++    and the blocks kept for them follow plain sliding window: only backed
++    blocks (chunk ends and decoded tokens) are cached and can serve a hit.
++    """
++
++    @classmethod
++    def find_longest_cache_hit(
++        cls,
++        block_hashes: BlockHashList,
++        max_length: int,
++        kv_cache_group_ids: list[int],
++        block_pool: BlockPool,
++        block_size: int,
++        manager_config: ManagerConfig,
++        alignment_tokens: int,
++        dcp_world_size: int = 1,
++        pcp_world_size: int = 1,
++        num_request_tokens: int | None = None,
++    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
++        return super(DFlashSlidingWindowManager, cls).find_longest_cache_hit(
++            block_hashes,
++            max_length,
++            kv_cache_group_ids,
++            block_pool,
++            block_size,
++            manager_config,
++            alignment_tokens,
++            dcp_world_size,
++            pcp_world_size,
++            num_request_tokens,
++        )
++
++    @classmethod
++    def reachable_block_mask(
++        cls,
++        start_block: int,
++        end_block: int,
++        alignment_tokens: int | None,
++        block_size: int,
++        manager_config: ManagerConfig,
++        retention_interval: int | None = None,
++        reachable_boundaries: Sequence[int] = (),
++        dcp_world_size: int = 1,
++        final_segment_end_block: int | None = None,
++    ) -> list[bool] | None:
++        return super(DFlashSlidingWindowManager, cls).reachable_block_mask(
++            start_block,
++            end_block,
++            alignment_tokens,
++            block_size,
++            manager_config,
++            retention_interval,
++            reachable_boundaries,
++            dcp_world_size,
++            final_segment_end_block,
++        )
++
++
+ class CircularBufferManager(SingleTypeKVCacheManager):
+     """Claims the ring's single block per request; prefix caching disabled.
+ 

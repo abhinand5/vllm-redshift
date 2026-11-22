@@ -1,0 +1,25 @@
+redshift patch: core/0101-rocm-rdna4-gpu-max-hw-queues.patch
+cut from: b6faecc59a..93edd85693 -- vllm/platforms/rocm.py
+commits:
+  334df5e945 Abhinand B: [F] ROCm RDNA4: default GPU_MAX_HW_QUEUES=2
+
+diff --git a/vllm/platforms/rocm.py b/vllm/platforms/rocm.py
+index 2ea879022e..912686041c 100644
+--- a/vllm/platforms/rocm.py
++++ b/vllm/platforms/rocm.py
+@@ -235,6 +235,15 @@ _ON_CDNA = any(arch in _GCN_ARCH for arch in ["gfx9", "gfx1250"])
+ _ON_RDNA = _ON_GFX1X and not _ON_CDNA
+ _ON_RDNA4 = any(arch in _GCN_ARCH for arch in ["gfx1200", "gfx1201"])
+ 
++# RDNA4: cap the HIP runtime at two hardware queues unless the user chose a
++# count. With the default (4), the queues of vLLM's streams share compute
++# pipes, and each kernel that follows a long one in the decode graph waits
++# ~12 us for the pipe to switch back to its queue (R9700, Inkling-2-Mini batch
++# 1: 37.8 -> 59.9 tok/s, ~1000 kernels per step). It must be set before the
++# HIP runtime initializes; _GCN_ARCH came from amdsmi, which does not init it.
++if _ON_RDNA4 and "GPU_MAX_HW_QUEUES" not in os.environ:
++    os.environ["GPU_MAX_HW_QUEUES"] = "2"
++
+ 
+ def _capability_from_gcn_arch(gcn_arch: str) -> tuple[int, int] | None:
+     """Parse (major, minor) from a GCN arch string, mirroring how
