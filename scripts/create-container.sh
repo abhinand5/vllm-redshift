@@ -8,5 +8,7 @@ if docker inspect "$N" >/dev/null 2>&1; then
   [ "$(docker inspect -f '{{.State.Running}}' "$N")" = false ] || { echo "$N is running; stop it first"; exit 1; }
   docker rm "$N" >/dev/null; echo "removed old $N"
 fi
-docker create --name "$N" "${DOCKER_ARGS[@]}" "$IMAGE" "${SERVE_CMD[@]}" "$@" >/dev/null
-echo "created $N from $IMAGE ($(docker image inspect -f '{{.Id}}' "$IMAGE" | cut -c8-19)); start with: docker start $N"
+# modelctl shows this label as the engine, so a recreate keeps its version current.
+ENGINE="vllm-redshift v$VERSION (vLLM ${VLLM_COMMIT:0:10} + gfx1201 series)"
+docker create --name "$N" --label "modelctl.engine=$ENGINE" "${DOCKER_ARGS[@]}" "$IMAGE" "${SERVE_CMD[@]}" "$@" >/dev/null
+echo "created $N ($ENGINE) from $IMAGE ($(docker image inspect -f '{{.Id}}' "$IMAGE" | cut -c8-19)); start with: docker start $N"
