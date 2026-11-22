@@ -1,5 +1,5 @@
 redshift patch: model/0201-inkling2-amd-gfx1201.patch
-cut from: b6faecc59a..a15d7e0248 -- vllm/models
+cut from: b6faecc59a..62f430a787 -- vllm/models
 commits:
   85101d9f9d Abhinand B: [A] Inkling2 ROCm: enable gfx12x bring-up, keep SM12x checks CUDA-only
   475655757d Abhinand B: [A] Inkling2 ROCm attention: KV cache layer config API (#61452)

@@ -4,6 +4,18 @@ Versions follow semver for people serving the model: MAJOR = incompatible serve 
 weights; MINOR = new vLLM base or new optimizations; PATCH = fixes only. Release tag: `inkling2-mini/vX.Y.Z`
 (must equal `VERSION` in `model.env`). Numbers: 1x R9700, FP8 KV, `scripts/release-check.sh` unless noted.
 
+## v0.4.1 (2026-11-22)
+vLLM base `bf151b7eb1` (unchanged). Same weights, same serve flags.
+- Fix: prefix caching could miss entirely when a prompt ended more than a few tokens past a 128-token boundary. The short-conv state cache kept
+  only each step's last few tokens, but a resent prompt (or the next turn of a chat) hits at the prompt's last
+  128-token-aligned position, up to 128 tokens before its end; whenever the prompt ended more than a few tokens past that
+  position, the hit found no conv state and nothing was reused. The kept tail now covers that distance. Measured on the
+  R9700: resending 34.5K / 36.3K / 38.1K / 41.0K-token prompts 8.1-10.0 s -> 0.10-0.54 s (all but the last <=128 tokens
+  cached); the next turn of a 41K-token conversation 0.57 s instead of ~11 s. KV pool unchanged (416,701 tokens), decode
+  unchanged.
+- Release check (single runs, T=0): decode story / code / explain 84.5 / 113.1 / 88.1 tok/s (v0.4.0: 87.1 / 116.1 / 86.5,
+  run-to-run noise); prefill 4K / 16K / 64K 4590 / 4504 / 3718 tok/s; two concurrent 191K-token needles both found.
+
 ## v0.4.0 (2026-11-22)
 vLLM base `bf151b7eb1` (unchanged). Same weights (served as shipped), same serve flags.
 - Long-context decode/verify attention on gfx12: more splits per KV head and new block configs, and blocks before the

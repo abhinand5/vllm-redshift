@@ -1,5 +1,5 @@
 redshift patch: core/0101-rocm-rdna4-gpu-max-hw-queues.patch
-cut from: b6faecc59a..a15d7e0248 -- vllm/platforms/rocm.py
+cut from: b6faecc59a..62f430a787 -- vllm/platforms/rocm.py
 commits:
   334df5e945 Abhinand B: [F] ROCm RDNA4: default GPU_MAX_HW_QUEUES=2
 

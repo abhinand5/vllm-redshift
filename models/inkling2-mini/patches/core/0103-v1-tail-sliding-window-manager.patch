@@ -1,13 +1,14 @@
 redshift patch: core/0103-v1-tail-sliding-window-manager.patch
-cut from: b6faecc59a..a15d7e0248 -- vllm/v1/core/single_type_kv_cache_manager.py
+cut from: b6faecc59a..62f430a787 -- vllm/v1/core/single_type_kv_cache_manager.py
 commits:
   d896b395af Abhinand B: [K] Inkling2 ROCm: tail-only conv-state cache manager
+  62f430a787 Abhinand B: [A] Inkling2 ROCm: conv-state tail covers the prefix-cache resend boundary
 
 diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
-index 84dfa53f19..15a9818fa7 100644
+index 84dfa53f19..1314222913 100644
 --- a/vllm/v1/core/single_type_kv_cache_manager.py
 +++ b/vllm/v1/core/single_type_kv_cache_manager.py
-@@ -1549,6 +1549,75 @@ class DFlashSlidingWindowManager(SlidingWindowManager):
+@@ -1549,6 +1549,96 @@ class DFlashSlidingWindowManager(SlidingWindowManager):
          return mask
  
  
@@ -25,7 +26,28 @@ index 84dfa53f19..15a9818fa7 100644
 +    Unlike DFlash, a prefix hit at `h` reads the window before `h`, so hits
 +    and the blocks kept for them follow plain sliding window: only backed
 +    blocks (chunk ends and decoded tokens) are cached and can serve a hit.
++
++    The replay boundaries sparse retention keeps (`replay_boundaries`) sit up
++    to one hit alignment plus the hash lookahead before a step's last token,
++    so the backed tail also spans that distance: otherwise a resend of a
++    prompt ending more than a few tokens past an aligned position finds its
++    hit's window on null blocks and misses entirely.
 +    """
++
++    def __init__(self, kv_cache_group: KVCacheGroup, **kwargs) -> None:
++        super().__init__(kv_cache_group, **kwargs)
++        # `get_reusable_prefix_length` floors `L - max(1, lookahead)` to the
++        # alignment; partial hash hits only lower the alignment.
++        hit_reach = self.scheduler_block_size + max(
++            1, self.block_pool.num_hash_lookahead_tokens
++        )
++        self.tail_tokens += hit_reach
++        if self.max_admission_blocks_per_request is not None:
++            params = self.manager_config.params
++            assert isinstance(params, DFlashSlidingWindowManager.Params)
++            self.max_admission_blocks_per_request += (
++                params.max_in_flight_steps + 1
++            ) * cdiv(hit_reach, self.block_size)
 +
 +    @classmethod
 +    def find_longest_cache_hit(
