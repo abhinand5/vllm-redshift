@@ -25,14 +25,14 @@ pinned upstream vLLM, and ships it as a Docker image with an OpenAI-compatible s
 | **Model** | [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini): 26B total / 3.5B active MoE, text + images |
 | **Weights** | as shipped: NVFP4 + MXFP8 experts, BF16 for the rest (20 GB, not requantized) |
 | **Context** | **196,608 tokens**, 2 requests at once (416,701-token FP8 KV pool) |
-| **Decode** | **~78 tok/s** plain, **78-113 tok/s** with DSpark speculative decoding (2.5-3.6x llama.cpp Q8) |
+| **Decode** | **~78 tok/s** plain, **78-113 tok/s** with DSpark speculative decoding (2.5-3.6x llama.cpp Q8); **80-119 tok/s** at the model's default sampling (T=1.0) |
 | **Prefill** | **~4,600 tok/s** at 4K-16K tokens, 3,700 tok/s at 64K |
 | **Extras** | tool calling, reasoning, up to 64 images per prompt, 0% CPU when idle |
 
 ```mermaid
 %%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#ED1C24"}}}}%%
 xychart-beta
-    title "Decode speed, 1 request, 512 tokens (tok/s, higher is better)"
+    title "Decode speed, 1 request, 512 tokens, greedy (tok/s, higher is better)"
     x-axis ["llama.cpp Q8", "redshift", "+ DSpark, prose", "+ DSpark, code"]
     y-axis "tokens / s" 0 --> 120
     bar [31.4, 77.6, 81.5, 112.7]
@@ -47,8 +47,9 @@ xychart-beta
     bar [4608, 4531, 3742]
 ```
 
-<sub>One R9700, FP8 KV, measured through the API with `scripts/release_check.py` on 2026-11-22. DSpark gains depend on
-how predictable the text is: code runs fastest. llama.cpp: Unsloth UD-Q8_K_XL GGUF on ROCm 7.2.4, no drafter. Two
+<sub>One R9700, FP8 KV, measured through the API with `scripts/release_check.py` (temperature 0) on 2026-11-22. At the
+model's default T=1.0 (1024 tokens, 11 seeds): prose 79.6, short code 102.0, 45K-token code prompt 118.6 tok/s. DSpark
+gains depend on how predictable the text is: code runs fastest. llama.cpp: Unsloth UD-Q8_K_XL GGUF on ROCm 7.2.4, no drafter. Two
 concurrent 191K-token "needle in a haystack" prompts: both answered correctly (155 s).</sub>
 
 ## Quick start
@@ -81,7 +82,8 @@ the model and its weights, and replaces the math underneath:
 - **Room for 196K context, twice.** A small vLLM core change keeps only the last few tokens of each convolution state
   (7.2 -> 3.9 GiB per 196K request). *Why:* two full-length requests fit in 32 GB next to the weights.
 - **DSpark speculative decoding on AMD**, with adaptive verification that checks only as many drafted tokens as are
-  likely to be accepted. *Why:* up to 1.45x faster decode at no quality cost.
+  likely to be accepted, and sampled (not argmax) drafts so it also pays off at T=1.0. *Why:* up to 1.45x faster decode
+  at no quality cost.
 - **Fewer, fuller GPU launches.** HIP graphs, two hardware queues on RDNA4 (38 -> 60 tok/s on its own) and fused small
   kernels (1,002 -> 762 launches per step). *Why:* with only 3.5B active parameters, launch overhead was the bottleneck.
 - **Vision** through vLLM's Triton attention (upstream's path needs flash-attn, which is not available here).

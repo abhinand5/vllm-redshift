@@ -4,6 +4,13 @@ Versions follow semver for people serving the model: MAJOR = incompatible serve 
 weights; MINOR = new vLLM base or new optimizations; PATCH = fixes only. Release tag: `inkling2-mini/vX.Y.Z`
 (must equal `VERSION` in `model.env`). Numbers: 1x R9700, FP8 KV, `scripts/release-check.sh` unless noted.
 
+## v0.3.1 (2026-11-22)
+vLLM base `bf151b7eb1` (unchanged). Same weights and image; serve flag change only.
+- DSpark drafts are now sampled (`"draft_sample_method":"probabilistic"`) instead of argmax. Requests at the model's
+  default sampling (T=1.0, top_p 1.0, top_k 0, min_p 0) used to accept only 1.6-2.2 tokens/step, because a greedy draft
+  is accepted with the target's probability of that one token. 1024-token decode, 11 seeds at T=1.0: 45K-token code
+  prompt 101.2 -> 118.6 tok/s (+17%), prose 73.2 -> 79.6 (+9%), short code 102.3 -> 102.0 (same). T=0 unchanged.
+
 ## v0.3.0 (2026-11-22)
 vLLM base `bf151b7eb1` (unchanged). Same weights, numbers as v0.2.0 (decode 78-113 tok/s, prefill 4.6K / 3.7K at 4K / 64K).
 - Image input on (`--limit-mm-per-prompt {"image":64}`; agents resend history, so the cap counts every image in a session): the ViT runs vLLM's Triton varlen attention on ROCm (no
