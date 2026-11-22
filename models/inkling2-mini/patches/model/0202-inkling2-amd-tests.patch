@@ -1,5 +1,5 @@
 redshift patch: model/0202-inkling2-amd-tests.patch
-cut from: b6faecc59a..93edd85693 -- tests
+cut from: b6faecc59a..47ef1ba127 -- tests
 commits:
   85101d9f9d Abhinand B: [A] Inkling2 ROCm: enable gfx12x bring-up, keep SM12x checks CUDA-only
   cc582f55e6 Abhinand B: [F] Inkling2 ROCm: support Inkling-2-Mini widths in MoE combine and SwiGLU quantize

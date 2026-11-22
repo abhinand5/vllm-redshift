@@ -4,6 +4,13 @@ Versions follow semver for people serving the model: MAJOR = incompatible serve 
 weights; MINOR = new vLLM base or new optimizations; PATCH = fixes only. Release tag: `inkling2-mini/vX.Y.Z`
 (must equal `VERSION` in `model.env`). Numbers: 1x R9700, FP8 KV, `scripts/release-check.sh` unless noted.
 
+## Unreleased
+- Image input on (`--limit-mm-per-prompt {"image":4}`): the ViT runs vLLM's Triton varlen attention on ROCm (no
+  upstream flash-attn needed) and keeps encoder graphs. Costs ~0.6 GiB VRAM; KV pool unchanged (416,701 tokens).
+  Text decode/prefill unchanged.
+- Idle CPU: `ROCPROFILER_REGISTER_ENABLED=0` in the image and container args; ROCr's AsyncEventsLoop no longer
+  busy-polls a CPU core at 100% while the server is idle.
+
 ## v0.2.0 (2026-11-22)
 vLLM base `bf151b7eb1` (unchanged). Patch series: 2 upstream PRs (#67685, #69028), 4 core fixes, the gfx1201 backend.
 - Decode without speculation 70 -> ~78 tok/s: NVFP4 decode GEMV for 1-2 tokens, launch fusion (1002 -> 762 launches/step).
