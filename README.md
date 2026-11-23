@@ -25,7 +25,7 @@ pinned upstream vLLM, and ships it as a Docker image with an OpenAI-compatible s
 | **Model** | [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini): 26B total / 3.5B active MoE, text + images |
 | **Weights** | as shipped: NVFP4 + MXFP8 experts, BF16 for the rest (20 GB, not requantized) |
 | **Context** | **196,608 tokens**, 2 requests at once (416,701-token FP8 KV pool) |
-| **Decode** | **~79 tok/s** plain, **86-116 tok/s** with DSpark speculative decoding (2.8-3.7x llama.cpp Q8); **86-133 tok/s** at the model's default sampling (T=1.0) |
+| **Decode** | **~79 tok/s** plain, **90-134 tok/s** with DSpark speculative decoding on short prompts (2.9-4.3x llama.cpp Q8); **92-116 tok/s** short and **~137 tok/s** at 41K under default sampling (T=1.0), **118-136 tok/s** at 159K |
 | **Prefill** | **~4,600 tok/s** at 4K-16K tokens, 3,700 tok/s at 64K |
 | **Extras** | tool calling, reasoning, up to 64 images per prompt, 0% CPU when idle |
 
@@ -57,9 +57,12 @@ with [`scripts/compare-engines.py`](scripts/compare-engines.py); raw runs in
   stream does not send reasoning tokens.
 - **llama.cpp**: Unsloth's `UD-Q8_K_XL` GGUF on ROCm 7.2.4, `-ngl 99 -c 70000 --flash-attn on`, default batch sizes;
   DSpark from `dspark-Inkling-2-Mini-Q8_0.gguf` with `--spec-draft-n-max 7`.
-- The release check (`scripts/release_check.py`, T=0, single run each) gives the same picture: decode 87.1 / 116.1 /
-  86.5 tok/s, prefill 4,557 / 4,523 / 3,728 tok/s. Two concurrent 191K-token "needle in a haystack" prompts are answered
-  correctly.
+- The head-to-head chart and table above were measured on **v0.4.0** (`compare-v0.4.0-20261122.json`). Subsequent
+  lossless releases (**v0.5.0 / v0.5.1**) added another **+7-12%** decode at T=1.0 (dev-server medians: 92.0 tok/s prose,
+  115.7 tok/s code, ~137 tok/s at 41K) and **-11%** step time at 159K context (34 -> 30 ms/step, 118-136 tok/s).
+- Current release check (`scripts/release_check.py`, v0.5.1 defaults, T=0, single run each): decode **89.9 / 119.6 /
+  95.8 tok/s** (story / code / explain; v0.5.0 warm run: 91.3 / 134.0 / 92.0), prefill **4,582 / 4,495 / 3,741 tok/s**
+  (4K / 16K / 64K). Two concurrent 191K-token "needle in a haystack" prompts are answered correctly.
 
 </details>
 
@@ -91,16 +94,19 @@ the model and its weights, and replaces the math underneath:
 
 - **4-bit and 8-bit experts on a GPU without FP4.** RDNA4 has no FP4 or block-scaled matrix units, so new Triton
   kernels decode the NVFP4 / MXFP8 weights to fp16 in registers (exactly) and multiply on the fp16/fp8 matrix cores; a
-  separate GEMV handles 1-2 token decode. *Why:* lossless weights at full speed, instead of a ~30 GB requantized copy.
+  direct BF16-activation multi-row GEMV handles 1-6 token decode/verify with SwiGLU fused in the epilogue. *Why:*
+  lossless weights at full speed, instead of a ~30 GB requantized copy.
 - **Inkling's attention, in Triton.** Relative-position bias, attention sinks and L2 clipping run in custom prefill and
-  decode kernels that read an FP8 KV cache directly. *Why:* there is no FlashAttention for this on ROCm, and FP8 halves the KV.
+  decode kernels that read an FP8 KV cache directly into fp16 with packed GQA groups. *Why:* there is no FlashAttention
+  for this on ROCm, and FP8 halves the KV.
 - **Room for 196K context, twice.** A small vLLM core change keeps only the last few tokens of each convolution state
   (7.2 -> 3.9 GiB per 196K request). *Why:* two full-length requests fit in 32 GB next to the weights.
-- **DSpark speculative decoding on AMD**, with adaptive verification that checks only as many drafted tokens as are
-  likely to be accepted, and sampled (not argmax) drafts so it also pays off at T=1.0. *Why:* up to 1.45x faster decode
-  at no quality cost.
+- **DSpark speculative decoding on AMD**, with an FP8 drafter (output-exact: target verification stays BF16), a
+  single-launch Markov recurrence, online context-aware adaptive verification that learns real step costs while serving,
+  and sampled (not argmax) drafts so it also pays off at T=1.0. *Why:* up to 1.5x+ faster decode at no quality cost.
 - **Fewer, fuller GPU launches.** HIP graphs, two hardware queues on RDNA4 (38 -> 60 tok/s on its own) and fused small
-  kernels (1,002 -> 762 launches per step). *Why:* with only 3.5B active parameters, launch overhead was the bottleneck.
+  kernels (including single-launch verify projections and fused final logit softcap). *Why:* with only 3.5B active
+  parameters, launch overhead was the bottleneck.
 - **Vision** through vLLM's Triton attention (upstream's path needs flash-attn, which is not available here).
 - **Quiet when idle:** `ROCPROFILER_REGISTER_ENABLED=0` stops a ROCm runtime thread from spinning a CPU core at 100%.
 
