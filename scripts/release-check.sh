@@ -8,7 +8,10 @@ cd "$(dirname "$0")/.."; M=$1; shift; . models/$M/model.env
 LOCK=${GPU_LOCK:-/tmp/r9700-gpu.lock}
 if [ -z "${_RC_LOCKED:-}" ]; then _RC_LOCKED=1 exec flock -w 3600 "$LOCK" "$0" "$M" "$@"; fi
 IMG=$(docker image inspect -f '{{.Id}}' "$IMAGE" | cut -c8-19)
-TAG=v$VERSION-$(date +%Y%m%d-%H%M)-$IMG; mkdir -p build/logs results/$M; LOG=build/logs/release-check-$TAG.log
+# opt-in flags in effect (passed into the container by docker-args.sh) are recorded and suffix the result name
+OPTS=$(compgen -e | { grep -E '^(VLLM_INKLING2_|VLLM_ADAPTIVE_VERIFICATION_)' || true; } | while read -r v; do printf '%s=%s ' "$v" "${!v}"; done)
+OPTS=${OPTS% }
+TAG=v$VERSION-$(date +%Y%m%d-%H%M)-$IMG${OPTS:+-opt}; mkdir -p build/logs results/$M; LOG=build/logs/release-check-$TAG.log
 scripts/serve.sh "$M" > "$LOG" 2>&1 &
 trap 'docker stop "redshift-$M" >/dev/null 2>&1 || true' EXIT
 for i in $(seq 1 120); do
@@ -19,8 +22,8 @@ for i in $(seq 1 120); do
 done
 curl -sf "http://127.0.0.1:$PORT/health" >/dev/null || { echo "server not ready after 10 min; see $LOG"; exit 1; }
 POOL=$(grep -o 'GPU KV cache size: [0-9,]* tokens, Maximum concurrency for [0-9,]* tokens per request: [0-9.]*x' "$LOG" | head -1)
-META=$(printf '{"version":"v%s","image":"%s","patches":"%s","vllm_commit":"%s","kv_pool":"%s"}' "$VERSION" "$IMG" "$PATCHES" "$VLLM_COMMIT" "$POOL")
-echo "server ready; $POOL"
+META=$(printf '{"version":"v%s","image":"%s","patches":"%s","vllm_commit":"%s","kv_pool":"%s","opts":"%s"}' "$VERSION" "$IMG" "$PATCHES" "$VLLM_COMMIT" "$POOL" "$OPTS")
+echo "server ready; $POOL${OPTS:+; opts: $OPTS}"
 python3 scripts/release_check.py --model-dir models/$M --out results/$M/$TAG.json --port "$PORT" \
   --served-name "$SERVED_NAME" --meta "$META" "$@"
 echo "results/$M/$TAG.json  (server log $LOG)"

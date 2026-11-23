@@ -1,5 +1,5 @@
 redshift patch: model/0202-inkling2-amd-tests.patch
-cut from: b6faecc59a..d6d374efa9 -- tests
+cut from: b6faecc59a..213e5830ca -- tests
 commits:
   85101d9f9d Abhinand B: [A] Inkling2 ROCm: enable gfx12x bring-up, keep SM12x checks CUDA-only
   cc582f55e6 Abhinand B: [F] Inkling2 ROCm: support Inkling-2-Mini widths in MoE combine and SwiGLU quantize
@@ -35,6 +35,7 @@ commits:
   dbdee9ca64 Abhinand B: [A1] Inkling2 AMD: packed GQA rows and fp16 operands for split-KV FP8 attention
   70dcbc6da5 Abhinand B: [F4] Inkling2 AMD: one-launch verify projections and fused logit softcap
   0112239d14 Abhinand B: [D1] Inkling2 AMD DSpark: one-launch Markov recurrence, softcap in the fold GEMM
+  213e5830ca Abhinand B: [Q1] Inkling2 AMD: opt-in e4m3 LM head (VLLM_INKLING2_FP8_LM_HEAD=1)
 
 diff --git a/tests/models/inkling2/test_attention.py b/tests/models/inkling2/test_attention.py
 index 7b87b97c92..7f4002bd8a 100644
@@ -230,7 +231,7 @@ index 7b87b97c92..7f4002bd8a 100644
 +    torch.testing.assert_close(new.float(), legacy.float(), atol=4e-3, rtol=1e-2)
 +    assert (new[num_tokens:] == 0).all()
 diff --git a/tests/models/inkling2/test_core_ops.py b/tests/models/inkling2/test_core_ops.py
-index 91bdd7d34f..62daadaeb1 100644
+index 91bdd7d34f..38321d8851 100644
 --- a/tests/models/inkling2/test_core_ops.py
 +++ b/tests/models/inkling2/test_core_ops.py
 @@ -3,6 +3,7 @@
@@ -418,7 +419,7 @@ index 91bdd7d34f..62daadaeb1 100644
  )
  @pytest.mark.parametrize("shape", [(131, 130), (6552, 2304)])
  @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-@@ -688,3 +782,282 @@ def test_sm12x_linear_large_batch_fallback():
+@@ -688,3 +782,304 @@ def test_sm12x_linear_large_batch_fallback():
      weight = torch.randn(129, 256, device=DEVICE).bfloat16()
      expected = torch.nn.functional.linear(x, weight)
      torch.testing.assert_close(linear(x, weight), expected, atol=0, rtol=0)
@@ -682,6 +683,28 @@ index 91bdd7d34f..62daadaeb1 100644
 +    check(out)
 +
 +
++@pytest.mark.skipif(not _is_rocm, reason="ROCm e4m3 row-scaled linears")
++@pytest.mark.parametrize("rows", [1, 16, 17, 40])
++def test_rocm_fp8_rows_linear_chunked(rows):
++    """`fp8_rows_linear_chunked` (prompt logprobs over the e4m3 LM head) is
++    `fp8_rows_linear` per 16-row chunk, bit for bit."""
++    from vllm.models.inkling2.amd.ops.linear import (
++        FP8_ROWS_MAX,
++        fp8_rows_linear,
++        fp8_rows_linear_chunked,
++        quantize_fp8_rows,
++    )
++
++    torch.manual_seed(0)
++    q, scale = quantize_fp8_rows((torch.randn(4096, 2304, device=DEVICE) * 0.02).bfloat16())
++    x = torch.randn(rows, 2304, device=DEVICE).bfloat16()
++    out = fp8_rows_linear_chunked(x, q, scale)
++    ref = torch.cat(
++        [fp8_rows_linear(x[i : i + FP8_ROWS_MAX], q, scale) for i in range(0, rows, FP8_ROWS_MAX)]
++    )
++    assert out.shape == (rows, 4096) and torch.equal(out, ref)
++
++
 +@pytest.mark.skipif(not _is_rocm, reason="the ROCm verify-window segment GEMV")
 +@pytest.mark.parametrize("rows", [2, 5, 8, 16])
 +def test_segment_gemv_rows_matches_gemv_rows(rows):
@@ -835,7 +858,7 @@ index bb3bd35a13..f7c1ee208d 100644
 +    fused = fp8_rows_linear(latent, q, scale, bias, softcap_base=base, softcap=cap)
 +    assert torch.equal(fused, add_softcap(base.contiguous(), plain, cap))
 diff --git a/tests/models/inkling2/test_model.py b/tests/models/inkling2/test_model.py
-index f15e81189d..b3a2709538 100644
+index f15e81189d..1a48edde03 100644
 --- a/tests/models/inkling2/test_model.py
 +++ b/tests/models/inkling2/test_model.py
 @@ -4,6 +4,8 @@
@@ -925,10 +948,66 @@ index f15e81189d..b3a2709538 100644
          ),
          max_model_len=2048,
          max_num_seqs=4,
-@@ -355,6 +386,319 @@ def test_tiny_model_generates(
+@@ -355,6 +386,375 @@ def test_tiny_model_generates(
          assert 0 <= accepted <= drafted
  
  
++@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm e4m3 LM head")
++@pytest.mark.parametrize("speculate", [False, True])
++def test_tiny_model_fp8_lm_head(tmp_path, monkeypatch, enable_pickle, speculate):
++    """VLLM_INKLING2_FP8_LM_HEAD=1: the target reads an e4m3 LM head, the
++    bf16 one is freed (after the DSpark fold when drafting), decode and
++    prompt logprobs (> 16 rows, chunked) run, and the prompt logprobs stay
++    close to the bf16 head's."""
++    import vllm.models.inkling2.amd.model as amd_model
++
++    model = _write_model(tmp_path, copy.deepcopy(TINY_CONFIG))
++    prompt = list(range(2, 120))
++
++    def run(fp8: bool):
++        monkeypatch.setenv("VLLM_INKLING2_FP8_LM_HEAD", "1" if fp8 else "0")
++        monkeypatch.setattr(amd_model, "FP8_LM_HEAD", fp8)
++        llm = LLM(
++            speculative_config=(
++                {"method": "dspark", "num_speculative_tokens": 7}
++                if speculate
++                else None
++            ),
++            model=model,
++            load_format="dummy",
++            seed=0,
++            skip_tokenizer_init=True,
++            tokenizer_mode="hf",
++            kv_cache_dtype="fp8_e4m3",
++            gpu_memory_utilization=0.10 if speculate else 0.035,
++            max_model_len=2048,
++            max_num_seqs=4,
++            limit_mm_per_prompt={"image": 0},
++        )
++        heads = llm.apply_model(
++            lambda m: (
++                m.lm_head.weight.numel(),
++                getattr(m.lm_head, "fp8_weight", None) is not None,
++            )
++        )[0]
++        out = llm.generate(
++            [{"prompt_token_ids": prompt}],
++            SamplingParams(max_tokens=16, temperature=0, ignore_eos=True, detokenize=False),
++        )[0].outputs[0].token_ids
++        logprobs = _prompt_logprobs(llm, prompt)
++        del llm
++        torch.accelerator.empty_cache()
++        return heads, out, logprobs
++
++    (bf16_numel, bf16_fp8), _, ref = run(False)
++    (numel, has_fp8), tokens, logprobs = run(True)
++    assert bf16_numel > 0 and not bf16_fp8
++    assert numel == 0 and has_fp8
++    assert len(tokens) == 16 and all(0 <= t < 1000 for t in tokens)
++    assert len(logprobs) == len(ref) == len(prompt) - 1
++    assert max(abs(a - b) for a, b in zip(logprobs, ref)) < 0.1
++
++
 +@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm DSpark glue")
 +def test_tiny_model_adaptive_verification(tmp_path):
 +    """Adaptive verification (per-request draft budgets trimmed on device)
@@ -1245,7 +1324,7 @@ index f15e81189d..b3a2709538 100644
  def test_tiny_model_lora_with_quantized_experts(tmp_path):
      """With LoRA enabled, the NVFP4 / MXFP8 experts are no LoRA target: the
      engine starts (its warmup adapter covers every LoRA module) and decodes
-@@ -384,11 +728,12 @@ def _record_moe_routing(model: torch.nn.Module) -> None:
+@@ -384,11 +784,12 @@ def _record_moe_routing(model: torch.nn.Module) -> None:
      loop message controllers (dummy ones leave every pass alike), then
      record, in call order, the torch reference routing of every MoE call's
      input (sorted expert ids per token)."""
@@ -1261,7 +1340,7 @@ index f15e81189d..b3a2709538 100644
      calls: list[torch.Tensor] = []
      model.routing_calls = calls
      generator = torch.Generator(device="cuda").manual_seed(0)
-@@ -423,13 +768,12 @@ def test_tiny_model_routed_experts(tmp_path, enable_pickle, looped):
+@@ -423,13 +824,12 @@ def test_tiny_model_routed_experts(tmp_path, enable_pickle, looped):
      order (a loop core layer has one per pass), each the experts that visit's
      MoE call routed every prompt token to."""
      config = TINY_LOOP_CONFIG if looped else TINY_CONFIG
@@ -1277,7 +1356,7 @@ index f15e81189d..b3a2709538 100644
          max_model_len=2048,
          max_num_seqs=4,
          enforce_eager=True,
-@@ -459,6 +803,235 @@ def test_tiny_model_routed_experts(tmp_path, enable_pickle, looped):
+@@ -459,6 +859,235 @@ def test_tiny_model_routed_experts(tmp_path, enable_pickle, looped):
          assert not torch.equal(captured[:, 1], captured[:, 3])
  
  

@@ -1,5 +1,5 @@
 redshift patch: core/0105-adaptive-verify-online-refit.patch
-cut from: b6faecc59a..d6d374efa9 -- vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+cut from: b6faecc59a..213e5830ca -- vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
 commits:
   cfc534db8e Abhinand B: [S2] Adaptive verification: online cost refit with a context-length term
 

@@ -1,5 +1,5 @@
 redshift patch: core/0104-gpu-runner-adaptive-verify-profile.patch
-cut from: b6faecc59a..d6d374efa9 -- vllm/v1/worker/gpu/model_runner.py
+cut from: b6faecc59a..213e5830ca -- vllm/v1/worker/gpu/model_runner.py
 commits:
   d2632a0c6c Abhinand B: [S] Inkling2 ROCm: adaptive DSpark verification
   cfc534db8e Abhinand B: [S2] Adaptive verification: online cost refit with a context-length term

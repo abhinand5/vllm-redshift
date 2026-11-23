@@ -4,6 +4,27 @@ Versions follow semver for people serving the model: MAJOR = incompatible serve 
 weights; MINOR = new vLLM base or new optimizations; PATCH = fixes only. Release tag: `inkling2-mini/vX.Y.Z`
 (must equal `VERSION` in `model.env`). Numbers: 1x R9700, FP8 KV, `scripts/release-check.sh` unless noted.
 
+## v0.5.1 (2026-11-23)
+vLLM base `bf151b7eb1` (unchanged). Same weights, same serve flags. The default is unchanged and lossless, with the same
+outputs as v0.5.0.
+- New opt-in `VLLM_INKLING2_FP8_LM_HEAD=1`: the output head is read as e4m3 with one fp32 scale per row, quantized at load.
+  The DSpark drafter folds its projection into the BF16 head first, then shares the e4m3 head; the BF16 head is freed.
+  Prompt logprobs (more than 16 rows) run chunked over the same kernel. Measured on image 8ca221c1ea10, off vs on:
+  - DSpark fixed verify width 8: 28.9 -> 28.15 ms/step short, 30.0 -> 29.35 ms/step at 41K (2 runs each).
+  - No drafter: 72.2 -> 74.1 tok/s.
+  - Model memory: 19.80 -> 18.94 GiB (-0.86 GiB) with DSpark.
+  - Quality vs the BF16 head (teacher-forced on code / prose / 32K context): KL 0.00003 / 0.0001 / 0.00003 nats/token,
+    top-1 99.87 / 99.35 / 99.84%. Same-stack batch noise is KL ~0.004.
+- `docker-args.sh` passes host `VLLM_INKLING2_*` / `VLLM_ADAPTIVE_VERIFICATION_*` variables into the container (serve,
+  create-container, release-check). `release-check.sh` records them in the result (`opts`, `-opt` file suffix), and
+  `create-container.sh` adds them to the modelctl label.
+- New user guide: `docs/models/inkling-2-mini.md` (defaults, context / KV sizing, reasoning effort, tools, images,
+  warmup, every flag with its measured cost).
+- Release check, image 8ca221c1ea10:
+  - Default (`--quick`): decode 89.9 / 119.6 / 95.8 tok/s, prefill 4K / 16K 4582 / 4495, chat and tool call OK.
+  - With `VLLM_INKLING2_FP8_LM_HEAD=1` (full): decode 93.1 / 129.0 / 96.8, prefill 4611 / 4528 / 3741 (64K), two
+    concurrent 191K needles both found, chat and tool call OK, KV pool 416,701 tokens.
+
 ## v0.5.0 (2026-11-23)
 vLLM base `bf151b7eb1` (unchanged). Same weights (served as shipped), same serve flags. All changes are output-exact
 (draft-side changes only alter which tokens are proposed; verification still uses the BF16/NVFP4 target).

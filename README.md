@@ -78,6 +78,10 @@ curl localhost:8005/v1/chat/completions -H content-type:application/json \
 Want it always on? `scripts/create-container.sh inkling2-mini` makes a container `vllm-inkling2-mini` that you (or a
 model manager) can `docker start` / `docker stop`.
 
+**Configuring it:** [`docs/models/inkling-2-mini.md`](docs/models/inkling-2-mini.md) covers the defaults, context /
+concurrency / KV sizing, reasoning effort, tools and images, first-start warmup, and every opt-in flag with its measured
+speed, VRAM and quality cost.
+
 ## What was done, and why
 
 ### Inkling-2-Mini

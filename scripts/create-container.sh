@@ -9,6 +9,7 @@ if docker inspect "$N" >/dev/null 2>&1; then
   docker rm "$N" >/dev/null; echo "removed old $N"
 fi
 # modelctl shows this label as the engine, so a recreate keeps its version current.
-ENGINE="vllm-redshift v$VERSION (vLLM ${VLLM_COMMIT:0:10} + gfx1201 series)"
+OPTS=$(compgen -e | { grep -E '^VLLM_INKLING2_' || true; } | while read -r v; do printf ' %s=%s' "$v" "${!v}"; done)
+ENGINE="vllm-redshift v$VERSION (vLLM ${VLLM_COMMIT:0:10} + gfx1201 series)${OPTS:+ opts:$OPTS}"
 docker create --name "$N" --label "modelctl.engine=$ENGINE" "${DOCKER_ARGS[@]}" "$IMAGE" "${SERVE_CMD[@]}" "$@" >/dev/null
 echo "created $N ($ENGINE) from $IMAGE ($(docker image inspect -f '{{.Id}}' "$IMAGE" | cut -c8-19)); start with: docker start $N"
