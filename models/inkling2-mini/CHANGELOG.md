@@ -4,6 +4,31 @@ Versions follow semver for people serving the model: MAJOR = incompatible serve 
 weights; MINOR = new vLLM base or new optimizations; PATCH = fixes only. Release tag: `inkling2-mini/vX.Y.Z`
 (must equal `VERSION` in `model.env`). Numbers: 1x R9700, FP8 KV, `scripts/release-check.sh` unless noted.
 
+## v0.5.0 (2026-11-23)
+vLLM base `bf151b7eb1` (unchanged). Same weights (served as shipped), same serve flags. All changes are output-exact
+(draft-side changes only alter which tokens are proposed; verification still uses the BF16/NVFP4 target).
+- DSpark draft: global attention on the split-KV integer FP8 path (169K: 1.39 -> 0.65 ms per draft step); e4m3 row-scaled
+  copies of the 3 draft layers' block linears (-0.3 ms/step); the 7-step Markov recurrence in one launch with the softcap
+  fused into the fold GEMM.
+- NVFP4 MoE: 3-6-token verify batches take the BF16-activation direct path on a multi-row GEMV (one layer: 3 tokens
+  207 -> 175 us, 4 tokens 248 -> 219 us).
+- Adaptive verification learns real step costs while serving (GPU-event timing, no host sync), including a per-1K-token
+  context slope, instead of trusting only the startup profile. `VLLM_ADAPTIVE_VERIFICATION_ONLINE=0` disables it.
+- Split-KV decode/verify attention on gfx12: GQA groups packed without padding, fp16 operands for the FP8 KV cache
+  (full layer at 196K, 8 tokens: 842 -> 720 us). Verify-window attention projections in one launch; final logit softcap
+  in one kernel.
+- Dev-server A/B (1024 tokens, medians, baseline run 3x): T=1 prose 85.9 -> 92.0 tok/s (+7%), code 103.7 -> 115.7
+  (+12%), 41K-token prompt 136.9 -> 137.3; 512 tokens at 240K context 86.7 -> 105.0 (two runs each). At a fixed verify width of 8: 28.9 ->
+  28.4 ms/step (short) and 40.2 -> 38.2 ms/step (240K). No-spec decode unchanged (78.2 tok/s).
+- Release check (image d252b9e81c14, T=0, 512 tokens; v0.4.1 in brackets): decode story / code / explain 91.3 / 134.0 /
+  92.0 tok/s (84.5 / 113.1 / 88.1); prefill 4K / 16K / 64K 4610 / 4524 / 3734 tok/s (4590 / 4504 / 3718); two concurrent
+  191K-token needles both found; KV pool 416,701 tokens (unchanged). The first run after upgrading compiles the new kernels
+  into the `redshift-cache` volume while serving (that run: decode 65.0 / 83.6 / 68.0, prefill 4K 2973); later starts
+  reuse them.
+- Long context on the image (512 tokens, T=0, 4-6 runs; v0.4.1 dev-server runs in brackets): 55K 126-189 tok/s
+  (138-146), 112K 115-145 (105-110), 159K 118-136 at 30.1-31.2 ms/step (122-124 at 33.8-34.0 ms/step). The served
+  196,608-token limit is unchanged.
+
 ## v0.4.1 (2026-11-22)
 vLLM base `bf151b7eb1` (unchanged). Same weights, same serve flags.
 - Fix: prefix caching could miss entirely when a prompt ended more than a few tokens past a 128-token boundary. The short-conv state cache kept

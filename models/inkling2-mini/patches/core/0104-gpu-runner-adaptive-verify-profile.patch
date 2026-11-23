@@ -1,10 +1,11 @@
 redshift patch: core/0104-gpu-runner-adaptive-verify-profile.patch
-cut from: b6faecc59a..62f430a787 -- vllm/v1/worker/gpu/model_runner.py
+cut from: b6faecc59a..d6d374efa9 -- vllm/v1/worker/gpu/model_runner.py
 commits:
   d2632a0c6c Abhinand B: [S] Inkling2 ROCm: adaptive DSpark verification
+  cfc534db8e Abhinand B: [S2] Adaptive verification: online cost refit with a context-length term
 
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index 1f831da6ff..9e1d02ae88 100644
+index 1f831da6ff..6546286823 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
 @@ -1255,7 +1255,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
@@ -31,3 +32,14 @@ index 1f831da6ff..9e1d02ae88 100644
              )
              if randomize_inputs:
                  # All-zero input_ids route every token to the same experts.
+@@ -2158,6 +2162,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL
+         )
+         self.step_timing.forward_start()
++        if self.adaptive_verification is not None and not dummy_run:
++            self.adaptive_verification.step_started(
++                input_batch.num_tokens, batch_desc.cg_mode == CUDAGraphMode.FULL
++            )
+ 
+         # Run model.
+         if batch_desc.cg_mode == CUDAGraphMode.FULL:

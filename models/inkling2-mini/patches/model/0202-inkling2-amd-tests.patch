@@ -1,5 +1,5 @@
 redshift patch: model/0202-inkling2-amd-tests.patch
-cut from: b6faecc59a..62f430a787 -- tests
+cut from: b6faecc59a..d6d374efa9 -- tests
 commits:
   85101d9f9d Abhinand B: [A] Inkling2 ROCm: enable gfx12x bring-up, keep SM12x checks CUDA-only
   cc582f55e6 Abhinand B: [F] Inkling2 ROCm: support Inkling-2-Mini widths in MoE combine and SwiGLU quantize
@@ -31,9 +31,13 @@ commits:
   f622296445 Abhinand B: [A] Inkling2 AMD DSpark: e4m3 draft head and Markov fold
   a15d7e0248 Abhinand B: [A] Inkling2 AMD: direct NVFP4 MoE decode with bf16 activations
   62f430a787 Abhinand B: [A] Inkling2 ROCm: conv-state tail covers the prefix-cache resend boundary
+  419f1ecc9a Abhinand B: [V1] Inkling2 AMD: multi-row direct NVFP4 MoE GEMV for 3-6 token verify widths
+  dbdee9ca64 Abhinand B: [A1] Inkling2 AMD: packed GQA rows and fp16 operands for split-KV FP8 attention
+  70dcbc6da5 Abhinand B: [F4] Inkling2 AMD: one-launch verify projections and fused logit softcap
+  0112239d14 Abhinand B: [D1] Inkling2 AMD DSpark: one-launch Markov recurrence, softcap in the fold GEMM
 
 diff --git a/tests/models/inkling2/test_attention.py b/tests/models/inkling2/test_attention.py
-index 7b87b97c92..1b49dcd466 100644
+index 7b87b97c92..7f4002bd8a 100644
 --- a/tests/models/inkling2/test_attention.py
 +++ b/tests/models/inkling2/test_attention.py
 @@ -17,16 +17,19 @@ from vllm.platforms import current_platform
@@ -133,8 +137,100 @@ index 7b87b97c92..1b49dcd466 100644
  )
  @pytest.mark.parametrize("num_tokens", [1, 300])
  def test_gate_sink(num_tokens):
+@@ -649,3 +670,91 @@ def test_gate_sink(num_tokens):
+     expected = output.view(num_tokens, -1) * torch.sigmoid(gate.float()) * scale
+     assert actual.dtype == torch.bfloat16
+     torch.testing.assert_close(actual.float(), expected, atol=1e-2, rtol=1e-2)
++
++
++@requires_rocm
++@pytest.mark.parametrize("is_local", [False, True])
++@pytest.mark.parametrize(
++    "query_lens,kv_lens", [([1], [5000]), ([5, 3], [1500, 2100]), ([8], [9000])]
++)
++@torch.inference_mode()
++def test_rocm_split_fp8_kv_packed_f16_matches_legacy(
++    is_local, query_lens, kv_lens, monkeypatch
++):
++    """gfx12 split-KV programs on an FP8 cache with packed GQA rows and fp16
++    operands match the padded bf16-operand path and the reference."""
++    from vllm.models.inkling2 import rel_decode_attention
++    from vllm.models.inkling2.amd.ops import attention as amd_attention
++
++    torch.manual_seed(0)
++    device, num_heads, num_kv_heads, block_size = "cuda", 24, 8, 128
++    seqs = list(zip(query_lens, kv_lens))
++    num_tokens = sum(query_lens)
++    max_blocks = -(-max(kv_lens) // block_size)
++    num_blocks = len(seqs) * max_blocks + 1
++    kv = torch.randn(num_blocks, block_size, num_kv_heads, 2 * HEAD_DIM, device=device)
++    kv[..., :HEAD_DIM] = torch.nn.functional.normalize(kv[..., :HEAD_DIM], dim=-1) * 2
++    key_cache, value_cache = kv.to(torch.float8_e4m3fn).split(HEAD_DIM, dim=-1)
++    block_table = (
++        (torch.randperm(num_blocks - 1, device=device) + 1)
++        .view(len(seqs), max_blocks)
++        .int()
++    )
++    q = torch.randn(num_tokens, num_heads, HEAD_DIM, device=device)
++    q = (torch.nn.functional.normalize(q, dim=-1) * 3).bfloat16()
++    rel_logits = torch.randn(
++        num_tokens, num_heads, REL_EXTENT, device=device, dtype=torch.bfloat16
++    )
++    width = num_heads * HEAD_DIM
++    proj = torch.randn(num_tokens + 1, width + num_heads + 4, device=device).bfloat16()
++    gate, sinks = proj[:, :width], proj[:, width : width + num_heads]
++    cu_seqlens_q = torch.tensor(
++        [0, *torch.tensor(query_lens).cumsum(0).tolist()],
++        dtype=torch.int32,
++        device=device,
++    )
++    seqused_k = torch.tensor(kv_lens, dtype=torch.int32, device=device)
++    scale = HEAD_DIM**-0.5
++    q_in = torch.cat([q, q[:1]])
++    rel_in = shear_rel_logits(rel_logits, seqs, 128, is_local)
++
++    def run(new: bool):
++        monkeypatch.setattr(amd_attention, "_PACKED_SPLIT", new)
++        monkeypatch.setattr(amd_attention, "_F16_KV_SPLIT", new)
++        out = torch.full_like(gate, float("nan"))
++        rel_decode_attention(
++            q_in,
++            key_cache,
++            value_cache,
++            rel_in,
++            gate,
++            sinks,
++            out,
++            block_table=block_table,
++            cache_seqlens=seqused_k,
++            cu_seqlens_q=cu_seqlens_q,
++            max_query_len=max(query_lens),
++            num_actual_tokens=num_tokens,
++            softmax_scale=scale,
++            is_local=is_local,
++            num_splits=9,
++        )
++        return out
++
++    legacy, new = run(False), run(True)
++    ref_out, ref_lse = _ref_attention(
++        q,
++        key_cache.bfloat16(),
++        value_cache.bfloat16(),
++        rel_logits,
++        seqs,
++        block_table,
++        scale,
++        REL_EXTENT - 1 if is_local else None,
++    )
++    g, s = gate[:num_tokens].float(), sinks[:num_tokens].float()
++    expected = ref_out.view(num_tokens, -1) * torch.sigmoid(g)
++    expected *= torch.sigmoid(ref_lse - s).repeat_interleave(HEAD_DIM, dim=1)
++    torch.testing.assert_close(new[:num_tokens].float(), expected, atol=1e-2, rtol=1e-2)
++    torch.testing.assert_close(new.float(), legacy.float(), atol=4e-3, rtol=1e-2)
++    assert (new[num_tokens:] == 0).all()
 diff --git a/tests/models/inkling2/test_core_ops.py b/tests/models/inkling2/test_core_ops.py
-index 91bdd7d34f..afa50d3e3d 100644
+index 91bdd7d34f..62daadaeb1 100644
 --- a/tests/models/inkling2/test_core_ops.py
 +++ b/tests/models/inkling2/test_core_ops.py
 @@ -3,6 +3,7 @@
@@ -322,7 +418,7 @@ index 91bdd7d34f..afa50d3e3d 100644
  )
  @pytest.mark.parametrize("shape", [(131, 130), (6552, 2304)])
  @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-@@ -688,3 +782,261 @@ def test_sm12x_linear_large_batch_fallback():
+@@ -688,3 +782,282 @@ def test_sm12x_linear_large_batch_fallback():
      weight = torch.randn(129, 256, device=DEVICE).bfloat16()
      expected = torch.nn.functional.linear(x, weight)
      torch.testing.assert_close(linear(x, weight), expected, atol=0, rtol=0)
@@ -584,8 +680,29 @@ index 91bdd7d34f..afa50d3e3d 100644
 +    x.copy_(torch.randn_like(x))
 +    graph.replay()
 +    check(out)
++
++
++@pytest.mark.skipif(not _is_rocm, reason="the ROCm verify-window segment GEMV")
++@pytest.mark.parametrize("rows", [2, 5, 8, 16])
++def test_segment_gemv_rows_matches_gemv_rows(rows):
++    from vllm.models.inkling2.amd.ops.linear import gemv_rows
++    from vllm.models.inkling2.amd.ops.segment_gemv import segment_gemv_rows
++
++    g = torch.Generator().manual_seed(rows)
++    k = 4608
++    xs = [torch.randn(rows, 2 * k, generator=g).bfloat16().cuda()[:, :k] for _ in range(3)]
++    ns = [7200, 1024, 1024, 24, 24]
++    ws = [(torch.randn(n, k, generator=g) * 0.02).bfloat16().cuda() for n in ns]
++    pairs = list(zip([xs[0], xs[1], xs[2], xs[1], xs[2]], ws))
++    outs = segment_gemv_rows(pairs)
++    assert outs is not None
++    for (x, w), out in zip(pairs, outs):
++        ref = (x.float() @ w.float().T).bfloat16()
++        torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
++        if w.shape[0] >= 256:
++            assert torch.equal(out, gemv_rows(x, w))
 diff --git a/tests/models/inkling2/test_dspark.py b/tests/models/inkling2/test_dspark.py
-index bb3bd35a13..73841a296e 100644
+index bb3bd35a13..f7c1ee208d 100644
 --- a/tests/models/inkling2/test_dspark.py
 +++ b/tests/models/inkling2/test_dspark.py
 @@ -3,6 +3,7 @@
@@ -665,6 +782,58 @@ index bb3bd35a13..73841a296e 100644
  def _all_reduce_norm_worker(rank: int, world: int, port: int, queue) -> None:
      from tests.utils import init_test_distributed_environment
      from vllm.distributed import (
+@@ -211,3 +259,51 @@ def test_all_reduce_add_rmsnorm_matches_unfused(world):
+     mp.spawn(_all_reduce_norm_worker, args=(world, 29620 + world, queue), nprocs=world)
+     results = [queue.get() for _ in range(world)]
+     assert all(not failures for _, failures, _ in results), results
++
++
++@pytest.mark.parametrize("rows,vocab", [(1, 1000), (9, 201088)])
++def test_fused_softcap_matches_torch_ops(rows, vocab):
++    """`softcap_` rounds like LogitsProcessor's `/ c`, `tanh`, `* c` on bf16."""
++    from vllm.models.inkling2.amd.ops.dspark import softcap_
++
++    g = torch.Generator().manual_seed(5)
++    cap = 30.0
++    x = (torch.randn(rows, vocab, generator=g) * 25).bfloat16().to(DEVICE)
++    ref = torch.tanh(x / cap) * cap
++    out = softcap_(x.clone(), cap)
++    mismatch = (out != ref).float().mean().item()
++    torch.testing.assert_close(out, ref, atol=0, rtol=1e-2)
++    assert mismatch < 1e-3, mismatch
++
++
++@pytest.mark.skipif(not _is_rocm, reason="the ROCm fused Markov step")
++@pytest.mark.parametrize("rows", [1, 2, 16])
++def test_fused_markov_step_matches_unfused(rows):
++    """`markov_rnn_step` follows the embedding + cat + addmm + gate chain (to
++    the GEMM's summation order) and the fold GEMM's softcap epilogue equals
++    `add_softcap` after it bit for bit."""
++    from vllm.models.inkling2.amd.ops.dspark import markov_rnn_step
++    from vllm.models.inkling2.amd.ops.linear import fp8_rows_linear, quantize_fp8_rows
++
++    g = torch.Generator().manual_seed(rows)
++    rank, hidden, vocab, cap = 256, 4608, 20000, 30.0
++    state = (torch.randn(rows, rank, generator=g) * 0.5).bfloat16().to(DEVICE)
++    w1 = (torch.randn(vocab, rank, generator=g) * 0.5).bfloat16().to(DEVICE)
++    weight = (torch.randn(3 * rank, 2 * rank + 2 * hidden, generator=g) * 0.05)
++    weight = weight.bfloat16().to(DEVICE)
++    context = torch.randn(rows, 3 * rank, generator=g).to(DEVICE)
++    prev = torch.randint(0, vocab, (rows,), generator=g).to(DEVICE)
++    inputs = torch.cat([state, w1[prev]], dim=-1)
++    raw = torch.addmm(context, inputs, weight[:, : 2 * rank].T, out_dtype=torch.float32)
++    ref_state, ref_latent = markov_gate(raw, state)
++    new_state, latent = markov_rnn_step(state, prev, w1, weight, context)
++    torch.testing.assert_close(new_state, ref_state, atol=2e-2, rtol=2e-2)
++    torch.testing.assert_close(latent, ref_latent, atol=2e-2, rtol=2e-2)
++
++    fold = (torch.randn(vocab, rank, generator=g) * 0.1).to(DEVICE)
++    q, scale = quantize_fp8_rows(fold)
++    bias = torch.randn(vocab, generator=g).bfloat16().to(DEVICE)
++    base = (torch.randn(rows, 3, vocab, generator=g) * 20).bfloat16().to(DEVICE)[:, 1]
++    plain = fp8_rows_linear(latent, q, scale, bias)
++    fused = fp8_rows_linear(latent, q, scale, bias, softcap_base=base, softcap=cap)
++    assert torch.equal(fused, add_softcap(base.contiguous(), plain, cap))
 diff --git a/tests/models/inkling2/test_model.py b/tests/models/inkling2/test_model.py
 index f15e81189d..b3a2709538 100644
 --- a/tests/models/inkling2/test_model.py
@@ -1484,10 +1653,10 @@ index a975b238eb..feafc55c50 100644
      the dequantized operands, scaled per row (NVFP4) and rounded to bf16."""
 diff --git a/tests/models/inkling2/test_quant_rocm.py b/tests/models/inkling2/test_quant_rocm.py
 new file mode 100644
-index 0000000000..17be9aeee2
+index 0000000000..55bd2d2e45
 --- /dev/null
 +++ b/tests/models/inkling2/test_quant_rocm.py
-@@ -0,0 +1,815 @@
+@@ -0,0 +1,819 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Inkling2 quantization on ROCm (`amd/`): hf_quant_config.json parameter
@@ -2074,7 +2243,7 @@ index 0000000000..17be9aeee2
 +    )
 +
 +
-+@pytest.mark.parametrize("tokens", [1, 2, 5])
++@pytest.mark.parametrize("tokens", [1, 2, 3, 5, 8, 16])
 +def test_nvfp4_moe_direct_decode_matches_bf16_reference(
 +    dist_init, monkeypatch, tokens: int
 +):
@@ -2089,7 +2258,9 @@ index 0000000000..17be9aeee2
 +    )
 +    plan = moe.experts.plan(tokens)
 +    direct = moe.experts.direct_decode(tokens, plan)
-+    assert direct == (plan.tile == 16 and plan.max_ctas <= 16)
++    assert direct == (
++        plan.tile == 16 and plan.max_ctas <= nvfp4_moe.DIRECT_MAX_CTAS
++    )
 +    out = moe(x)
 +    assert bool(calls) == direct
 +    ref = _moe_reference(moe, x, MOE_CONFIG, "bf16" if direct else "mxfp8")
@@ -2267,7 +2438,9 @@ index 0000000000..17be9aeee2
 +    moe = _build_moe("nvfp4", _random_moe_weights("nvfp4"))
 +    x = torch.randn(tokens, 512, device="cuda").bfloat16()
 +    out = moe(x)
-+    ref = _moe_reference(moe, x, MOE_CONFIG)
++    plan = moe.experts.plan(tokens)
++    direct = moe.experts.direct_decode(tokens, plan)
++    ref = _moe_reference(moe, x, MOE_CONFIG, "bf16" if direct else "mxfp8")
 +    scale = ref.abs().max().item()
 +    assert scale > 0.1
 +    torch.testing.assert_close(out, ref, atol=1e-2 * scale, rtol=2e-2)
